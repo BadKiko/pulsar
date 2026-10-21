@@ -59,10 +59,12 @@ class Controller : public ApiHooks {
   void start_pipeline(const std::string &phrase, bool earcon);
   void stop_streaming();
   void play_tts();
-  void tts_finished();
+  void tts_finished(bool ok);
   void finish_interaction();
+  void interrupt_speech();
   void stop_timer_ring();
   void ring_timer();
+  void resume_ring();
   void update_ui();
   void update_detection();
   void duck(bool on);
@@ -93,8 +95,13 @@ class Controller : public ApiHooks {
   bool tts_played_ = false;
   bool continue_conversation_ = false;
   bool announcing_ = false;
+  // Completion callbacks act only for what is still current: dialog_ changes whenever a dialog
+  // starts or ends, announce_seq_ whenever an HA announcement starts or is interrupted.
+  uint64_t dialog_ = 0;
+  uint64_t announce_seq_ = 0;
   // timers
   bool timer_ringing_ = false;
+  bool ring_yielded_ = false;  // the ring gave the ANNOUNCE channel to speech; resume_ring() continues it
   uint64_t timer_ring_tick_ = 0;
   int64_t timer_ring_started_ms_ = 0;
   int64_t timer_end_ms_ = 0;  // active countdown shown on the clock (0 = none)

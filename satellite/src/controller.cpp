@@ -165,9 +165,8 @@ bool Controller::start() {
         if (sendspin_pairing_prompt_ && sendspin_) return sendspin_->confirm_pairing_window();
         if (timer_ringing_) return stop_timer_ring();
         if (phase_ == Phase::SPEAKING || announcing_) {
-          player_.stop(Channel::ANNOUNCE);
-          announcing_ = false;
-          return tts_finished();
+          interrupt_speech();
+          return finish_interaction();
         }
         if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) {
           api_->voice_request_stop();
@@ -264,10 +263,7 @@ void Controller::on_wake(const std::string &phrase) {
   if (st_.mic_muted || hw_mic_muted_) return;
   if (timer_ringing_) return stop_timer_ring();  // the wake word works as a stop word while ringing
   if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) return;
-  if (phase_ == Phase::SPEAKING || announcing_) {  // barge-in: interrupt the answer
-    player_.stop(Channel::ANNOUNCE);
-    announcing_ = false;
-  }
+  if (phase_ == Phase::SPEAKING || announcing_) interrupt_speech();  // barge-in: cut the answer short
   start_pipeline(phrase, true);
 }
 
@@ -280,6 +276,7 @@ void Controller::start_pipeline(const std::string &phrase, bool earcon) {
   }
   LOGI("starting voice pipeline (wake='%s')", phrase.c_str());
   phase_ = Phase::LISTENING;
+  dialog_++;
   listen_started_ms_ = Loop::now_ms();
   loop_.add_timer(kCommandAfterWakeMs + 100, [this] { update_commands(); });
   tts_url_.clear();
@@ -350,11 +347,15 @@ void Controller::play_tts() {
   tts_played_ = true;
   phase_ = Phase::SPEAKING;
   update_ui();
-  player_.play(Channel::ANNOUNCE, {tts_url_}, [this](bool) { tts_finished(); });
+  player_.play(Channel::ANNOUNCE, {tts_url_}, [this, dialog = dialog_](bool ok) {
+    if (dialog == dialog_ && phase_ == Phase::SPEAKING) tts_finished(ok);
+    resume_ring();
+  });
 }
 
-void Controller::tts_finished() {
-  if (continue_conversation_ && !st_.mic_muted && !hw_mic_muted_) {
+// A cut-short or failed answer does not reopen the microphone, nor does a ringing timer.
+void Controller::tts_finished(bool ok) {
+  if (ok && continue_conversation_ && !timer_ringing_ && !st_.mic_muted && !hw_mic_muted_) {
     continue_conversation_ = false;
     start_pipeline("", false);
     return;
@@ -365,6 +366,7 @@ void Controller::tts_finished() {
 void Controller::finish_interaction() {
   mic_.set_streaming(false);
   phase_ = Phase::IDLE;
+  dialog_++;
   tts_played_ = false;
   continue_conversation_ = false;
   if (!timer_ringing_ && !announcing_) duck(false);
@@ -373,6 +375,17 @@ void Controller::finish_interaction() {
     loop_.add_timer(1200, [this] { update_ui(); });
   } else {
     update_ui();
+  }
+}
+
+// Cuts the TTS answer or HA announcement short. An interrupted announcement ends here (its
+// completion callback then only reports to HA); the dialog of an interrupted answer is ended or
+// replaced by the caller, otherwise by the TTS completion callback.
+void Controller::interrupt_speech() {
+  player_.stop(Channel::ANNOUNCE);
+  if (announcing_) {
+    announcing_ = false;
+    announce_seq_++;
   }
 }
 
@@ -385,15 +398,19 @@ void Controller::on_announce(const AnnounceRequest &req) {
   phase_ = Phase::SPEAKING;
   announcing_ = true;
   update_ui();
-  bool conv = req.start_conversation;
-  player_.play(Channel::ANNOUNCE, urls, [this, conv](bool ok) {
-    announcing_ = false;
-    api_->voice_announce_finished(ok);
-    if (conv && !st_.mic_muted && !hw_mic_muted_) {
-      start_pipeline("", false);
-    } else {
-      finish_interaction();
+  const bool conv = req.start_conversation;
+  const uint64_t seq = ++announce_seq_;
+  player_.play(Channel::ANNOUNCE, urls, [this, conv, seq](bool ok) {
+    api_->voice_announce_finished(ok);  // exactly once per announcement, also when cut short
+    if (seq == announce_seq_) {
+      announcing_ = false;
+      if (ok && conv && !timer_ringing_ && !st_.mic_muted && !hw_mic_muted_) {
+        start_pipeline("", false);
+      } else {
+        finish_interaction();
+      }
     }
+    resume_ring();
   });
 }
 
@@ -448,20 +465,33 @@ void Controller::on_timer_event(const TimerInfo &t) {
   }
 }
 
+// The ring gives the ANNOUNCE channel to speech (TTS answer, HA announcement) and resumes after it.
 void Controller::ring_timer() {
+  if (timer_ring_tick_) loop_.cancel_timer(timer_ring_tick_);
+  timer_ring_tick_ = 0;
   if (!timer_ringing_) return;
   if (Loop::now_ms() - timer_ring_started_ms_ > kTimerRingMaxMs) return stop_timer_ring();
+  if (announcing_ || phase_ == Phase::SPEAKING) {
+    ring_yielded_ = true;
+    return;
+  }
   player_.play(Channel::ANNOUNCE, {kSndTimer}, [this](bool) {
-    if (timer_ringing_) timer_ring_tick_ = loop_.add_timer(300, [this] { ring_timer(); });
+    if (timer_ringing_ && !timer_ring_tick_) timer_ring_tick_ = loop_.add_timer(300, [this] { ring_timer(); });
   });
+}
+
+void Controller::resume_ring() {
+  if (!ring_yielded_) return;
+  ring_yielded_ = false;
+  ring_timer();
 }
 
 void Controller::stop_timer_ring() {
   timer_ringing_ = false;
+  ring_yielded_ = false;
   if (timer_ring_tick_) loop_.cancel_timer(timer_ring_tick_);
   timer_ring_tick_ = 0;
-  player_.stop(Channel::ANNOUNCE);
-  announcing_ = false;
+  interrupt_speech();  // the ring, or the speech it yielded to
   if (phase_ == Phase::IDLE) duck(false);
   update_ui();
 }
@@ -561,10 +591,14 @@ void Controller::on_media_command(const MediaCommandRequest &cmd) {
       announcing_ = true;
       phase_ = phase_ == Phase::IDLE ? Phase::SPEAKING : phase_;
       update_ui();
-      player_.play(Channel::ANNOUNCE, {cmd.media_url}, [this](bool) {
-        announcing_ = false;
-        finish_interaction();
-        publish_media();
+      const uint64_t seq = ++announce_seq_;
+      player_.play(Channel::ANNOUNCE, {cmd.media_url}, [this, seq](bool) {
+        if (seq == announce_seq_) {
+          announcing_ = false;
+          finish_interaction();
+          publish_media();
+        }
+        resume_ring();
       });
     } else {
       if (sendspin_) sendspin_->yield_to_local();  // HA media takes the speaker from Sendspin
@@ -707,9 +741,7 @@ void Controller::on_command(const std::string &word) {
       if (timer_ringing_) {
         stop_timer_ring();
       } else if (phase_ == Phase::SPEAKING || announcing_) {
-        player_.stop(Channel::ANNOUNCE);
-        announcing_ = false;
-        continue_conversation_ = false;
+        interrupt_speech();
         finish_interaction();
       } else {
         music_pause();

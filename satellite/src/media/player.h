@@ -20,7 +20,11 @@ enum class PlayState { IDLE, LOADING, PLAYING, PAUSED, ERROR };
 
 class Player {
  public:
-  using DoneCb = std::function<void(bool ok)>;  // natural end (true) or error (false); not called on stop()
+  // Called exactly once per play(): true if every url played to its end; false if any url failed
+  // or the list was cut short by stop() or by a later play() on the same channel. A superseded
+  // list's done(false) is queued to the Loop by that stop()/play() call itself, so it runs after
+  // the caller returns and before anything the new playback reports.
+  using DoneCb = std::function<void(bool ok)>;
   using StateCb = std::function<void(Channel, PlayState)>;
 
   explicit Player(Loop &loop);

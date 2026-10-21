@@ -176,15 +176,18 @@ struct Player::Impl {
     Impl *impl = nullptr;
     Channel id = Channel::MUSIC;
     gp pipe = nullptr;
+    // Caller side, under done_mu: gen counts play()/stop() calls; done belongs to the latest play().
+    uint64_t gen = 0;
+    DoneCb done;
     // gst-thread state
     std::vector<std::string> urls;
     size_t index = 0;
-    DoneCb done;
+    uint64_t item_gen = 0;   // gen of the play() that loaded urls
     bool active = false;     // a url list is loaded
     bool want_play = false;  // user wants PLAYING (false => paused)
     bool buffering = false;
     bool reached_playing = false;
-    bool last_ok = true;
+    bool all_ok = true;
     double gain_cur = 1.0, gain_target = 1.0;
     unsigned ramp_src = 0;
     std::atomic<PlayState> state{PlayState::IDLE};
@@ -200,6 +203,7 @@ struct Player::Impl {
   Chan chans[2];
   std::mutex cb_mu;
   StateCb state_cb;
+  std::mutex done_mu;
 
   // ---- marshalling into the GLib thread ----
   struct Call {
@@ -232,16 +236,50 @@ struct Player::Impl {
     });
   }
 
-  void finish(Chan &c, bool ok_) {
+  // ---- completion (any thread) ----
+  // Installs done for a new play() (nullptr for stop()) and queues done(false) for the list it
+  // replaces. Returns the generation the new list's completion must match.
+  uint64_t supersede(Channel ch, DoneCb done) {
+    DoneCb old;
+    uint64_t gen;
+    {
+      std::lock_guard<std::mutex> lk(done_mu);
+      auto &c = chans[int(ch)];
+      old = std::move(c.done);
+      c.done = std::move(done);
+      gen = ++c.gen;
+    }
+    if (old) loop.post([old = std::move(old)] { old(false); });
+    return gen;
+  }
+  // Delivers the result of list gen unless a later play()/stop() superseded it meanwhile (that
+  // call already delivered false).
+  void complete(Channel ch, uint64_t gen, bool ok_) {
+    loop.post([this, ch, gen, ok_] {
+      DoneCb cb;
+      {
+        std::lock_guard<std::mutex> lk(done_mu);
+        auto &c = chans[int(ch)];
+        if (c.gen != gen) return;
+        cb = std::move(c.done);
+        c.done = nullptr;
+      }
+      if (cb) cb(ok_);
+    });
+  }
+
+  void halt(Chan &c, bool failed) {
     g.gst_element_set_state(c.pipe, GST_STATE_NULL);
     c.active = false;
     c.buffering = false;
     c.urls.clear();
-    DoneCb done = std::move(c.done);
-    c.done = nullptr;
-    if (!ok_) set_state(c, PlayState::ERROR);
+    if (failed) set_state(c, PlayState::ERROR);
     set_state(c, PlayState::IDLE);
-    if (done) loop.post([done, ok_] { done(ok_); });
+  }
+
+  void finish(Chan &c, bool ok_) {
+    halt(c, !ok_);
+    complete(c.id, c.item_gen, ok_);
   }
 
   void start_current(Chan &c) {
@@ -260,12 +298,12 @@ struct Player::Impl {
 
   // Current url finished (ok) or failed; go to the next or finish the list.
   void advance(Chan &c, bool ok_) {
-    c.last_ok = ok_;
+    c.all_ok = c.all_ok && ok_;
     if (c.index + 1 < c.urls.size()) {
       c.index++;
       start_current(c);
     } else {
-      finish(c, ok_);
+      finish(c, c.all_ok);
     }
   }
 
@@ -442,24 +480,21 @@ bool Player::init() {
 
 void Player::play(Channel ch, std::vector<std::string> urls, DoneCb done) {
   auto *d = impl_.get();
-  if (!d->ok) {
-    if (done) d->loop.post([done] { done(false); });
-    return;
-  }
-  d->invoke([d, ch, urls = std::move(urls), done = std::move(done)]() mutable {
+  uint64_t gen = d->supersede(ch, std::move(done));
+  if (!d->ok) return d->complete(ch, gen, false);
+  d->invoke([d, ch, gen, urls = std::move(urls)]() mutable {
     auto &c = d->chans[int(ch)];
-    c.done = nullptr;  // replaced playback: previous done callback is dropped
     if (urls.empty()) {
-      d->finish(c, false);
-      if (done) d->loop.post([done] { done(false); });
+      d->halt(c, true);
+      d->complete(ch, gen, false);
       return;
     }
     c.urls = std::move(urls);
     c.index = 0;
-    c.done = std::move(done);
+    c.item_gen = gen;
     c.active = true;
     c.want_play = true;
-    c.last_ok = true;
+    c.all_ok = true;
     d->start_current(c);
   });
 }
@@ -487,12 +522,12 @@ void Player::resume(Channel ch) {
 
 void Player::stop(Channel ch) {
   auto *d = impl_.get();
+  d->supersede(ch, nullptr);
   d->invoke([d, ch] {
     auto &c = d->chans[int(ch)];
     if (!c.active) return;
     LOGI("player: ch%d stop", int(ch));
-    c.done = nullptr;  // not called on stop()
-    d->finish(c, true);
+    d->halt(c, false);
   });
 }
 
