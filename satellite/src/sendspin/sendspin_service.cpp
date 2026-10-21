@@ -114,47 +114,39 @@ class AlwaysNetwork : public ss::SendspinNetworkProvider {
 // ---------------------------------------------------------------------------------------------
 // ALSA sink. configure()/release() run on the cs::Loop thread (stream start/end), write() on the
 // library's sync task; the PCM itself is opened lazily by write() so the loop never blocks on it.
+// io_mu_ is held by write() for its whole duration, including the snd_pcm_wait slices, so the Loop
+// thread never takes it blocking: configure()/release() only record a request (req_mu_, held for a
+// few instructions) and apply it right away if the audio thread is idle (try_lock); otherwise the
+// audio thread applies it at the next wait slice and abandons the write in progress.
 class AlsaSink {
  public:
   std::function<void(uint32_t frames, int64_t finish_us)> on_played;
 
   ~AlsaSink() {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(io_mu_);
     close_locked();
   }
 
-  void configure(uint32_t rate, uint8_t channels, uint8_t bits) {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (pcm_ && (rate != rate_ || channels != channels_ || bits != bits_)) close_locked();
-    if (pcm_) {  // same format: restart from an empty ring
-      snd_pcm_drop(pcm_);
-      if (snd_pcm_prepare(pcm_) < 0) close_locked();
-    }
-    want_rate_ = rate;
-    want_channels_ = channels;
-    want_bits_ = bits;
-    active_ = true;
-    open_failed_logged_ = false;
-    next_open_us_ = 0;
-    discarded_ = 0;
-    gain_ = target_gain_.load();  // a new stream starts at the current duck level, no ramp
-  }
+  void configure(uint32_t rate, uint8_t channels, uint8_t bits) { request(Req{Req::CONFIGURE, rate, channels, bits}); }
 
   // Stream ended: drop what is queued and release the device so dmix is not held while idle.
-  void release() {
-    std::lock_guard<std::mutex> lk(mu_);
-    active_ = false;
-    if (pcm_) {
-      LOGI("sendspin: stream summary: %.1f s written to the device, xruns %u", rate_ ? double(frames_total_) / rate_ : 0.0,
-           xruns_);
-      snd_pcm_drop(pcm_);
-    }
-    close_locked();
-  }
+  void release() { request(Req{Req::RELEASE, 0, 0, 0}); }
 
   void set_gain(float g) { target_gain_.store(std::clamp(g, 0.f, 1.f)); }
 
   size_t write(const uint8_t *data, size_t length, uint32_t timeout_ms) {
+    size_t r = write_once(data, length, timeout_ms);
+    // A request that arrived while io_mu_ was held (request()'s try_lock failed) must not wait for
+    // the next write: a RELEASE may be the last event, and the device would stay open.
+    if (req_gen_.load() != applied_gen_.load()) {
+      std::lock_guard<std::mutex> lk(io_mu_);
+      apply_pending_locked();
+    }
+    return r;
+  }
+
+ private:
+  size_t write_once(const uint8_t *data, size_t length, uint32_t timeout_ms) {
     const int64_t deadline = ss::SendspinClient::now_us() + int64_t(timeout_ms) * 1000;
     uint32_t frames_done = 0;
     int64_t finish_us = 0;
@@ -162,7 +154,8 @@ class AlsaSink {
     bool lost = false;
     uint32_t report = 0;
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      std::lock_guard<std::mutex> lk(io_mu_);
+      apply_pending_locked();
       bpf = size_t(want_channels_) * (want_bits_ / 8);
       if (!active_ || bpf == 0) return length;  // stale audio after stream end: discard
       if (!pcm_ && !open_locked()) {
@@ -188,6 +181,10 @@ class AlsaSink {
           if (left_ms <= 0) break;
           int r = snd_pcm_wait(pcm_, int(std::min<int64_t>(left_ms, kWaitSliceMs)));
           if (r < 0 && !recover_locked(r)) break;
+          if (req_gen_.load() != applied_gen_.load()) {  // stream restarted/ended: this audio is stale
+            apply_pending_locked();
+            return length;
+          }
           continue;
         }
         snd_pcm_uframes_t chunk = std::min<snd_pcm_uframes_t>(frames_total - frames_done, snd_pcm_uframes_t(avail));
@@ -228,7 +225,60 @@ class AlsaSink {
     return size_t(frames_done) * bpf;
   }
 
- private:
+ struct Req {
+    enum Kind { NONE, CONFIGURE, RELEASE } kind;
+    uint32_t rate;
+    uint8_t channels, bits;
+  };
+
+  void request(Req r) {
+    {
+      std::lock_guard<std::mutex> lk(req_mu_);
+      req_ = r;
+      req_gen_.fetch_add(1);
+    }
+    std::unique_lock<std::mutex> lk(io_mu_, std::try_to_lock);
+    if (lk) apply_pending_locked();
+  }
+
+  void apply_pending_locked() {
+    Req r;
+    {
+      std::lock_guard<std::mutex> lk(req_mu_);
+      applied_gen_.store(req_gen_.load());
+      r = req_;
+      req_.kind = Req::NONE;
+    }
+    if (r.kind == Req::CONFIGURE) apply_configure_locked(r.rate, r.channels, r.bits);
+    else if (r.kind == Req::RELEASE) apply_release_locked();
+  }
+
+  void apply_configure_locked(uint32_t rate, uint8_t channels, uint8_t bits) {
+    if (pcm_ && (rate != rate_ || channels != channels_ || bits != bits_)) close_locked();
+    if (pcm_) {  // same format: restart from an empty ring
+      snd_pcm_drop(pcm_);
+      if (snd_pcm_prepare(pcm_) < 0) close_locked();
+    }
+    want_rate_ = rate;
+    want_channels_ = channels;
+    want_bits_ = bits;
+    active_ = true;
+    open_failed_logged_ = false;
+    next_open_us_ = 0;
+    discarded_ = 0;
+    gain_ = target_gain_.load();  // a new stream starts at the current duck level, no ramp
+  }
+
+  void apply_release_locked() {
+    active_ = false;
+    if (pcm_) {
+      LOGI("sendspin: stream summary: %.1f s written to the device, xruns %u", rate_ ? double(frames_total_) / rate_ : 0.0,
+           xruns_);
+      snd_pcm_drop(pcm_);
+    }
+    close_locked();
+  }
+
   bool open_locked() {
     const int64_t now = ss::SendspinClient::now_us();
     if (now < next_open_us_) return false;
@@ -371,7 +421,11 @@ class AlsaSink {
     delay_max_ = 0;
   }
 
-  std::mutex mu_;
+  std::mutex io_mu_;  // audio-thread state below, held across write()
+  std::mutex req_mu_;
+  Req req_{Req::NONE, 0, 0, 0};
+  std::atomic<uint32_t> req_gen_{0};
+  std::atomic<uint32_t> applied_gen_{0};
   snd_pcm_t *pcm_ = nullptr;
   bool active_ = false;
   uint32_t want_rate_ = 0, rate_ = 0;
@@ -380,7 +434,7 @@ class AlsaSink {
   int64_t next_open_us_ = 0;
   uint32_t discarded_ = 0;  // frames consumed without reaching the device, not yet reported
   std::atomic<float> target_gain_{1.f};
-  float gain_ = 1.f;  // sync task only (under mu_)
+  float gain_ = 1.f;  // sync task only (under io_mu_)
   std::vector<int16_t> scratch_;
   // stats
   uint64_t frames_total_ = 0;
