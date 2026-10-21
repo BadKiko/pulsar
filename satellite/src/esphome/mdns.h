@@ -1,13 +1,15 @@
 // Minimal mDNS (RFC 6762/6763) responder advertising DNS-SD service instances over IPv4 under one
 // host name. Answers PTR/SRV/TXT/A/ANY queries for each service, its instance and "<host>.local",
 // lists every service type in "_services._dns-sd._udp.local" enumeration, sends unsolicited
-// announcements on start, on add_service() and on IP change, and goodbyes on destruction.
+// announcements on start, on add_service()/set_txt(), when the address or link changes (rtnetlink,
+// with a 30 s poll as fallback), and goodbyes on destruction.
 #pragma once
 
 #include <netinet/in.h>
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/loop.h"
@@ -50,6 +52,11 @@ class MdnsResponder {
 
   bool refresh_iface();  // returns true if the interface/IP changed
   void join_group();
+  // Re-reads the interface, re-asserts the multicast membership and, on change or when forced
+  // (link came back), announces again.
+  void check_network(bool force_announce);
+  bool open_netlink();
+  void on_netlink();
   void on_readable();
   void handle_query(const uint8_t *p, size_t n, const sockaddr_in &from);
   std::string build(uint16_t id, uint32_t answers, uint32_t additional, uint32_t ttl_cap, bool goodbye,
@@ -62,10 +69,16 @@ class MdnsResponder {
   std::string host_fqdn_;  // "<host>.local"
   std::vector<Service> services_;
   int fd_ = -1;
+  int nl_fd_ = -1;  // rtnetlink: address/link changes
   int ifindex_ = 0;
   uint32_t ip_ = 0;  // network byte order
   std::string ifname_;
-  std::vector<uint64_t> timers_;
+  bool join_failed_ = false;
+  std::vector<std::pair<int, unsigned>> link_flags_;  // ifindex -> last IFF_* flags seen
+  uint64_t poll_timer_ = 0;
+  uint64_t change_timer_ = 0;  // debounces a burst of netlink events
+  bool change_forced_ = false;
+  uint64_t announce_timers_[2] = {};
 };
 
 }  // namespace cs

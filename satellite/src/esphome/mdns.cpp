@@ -2,6 +2,8 @@
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -111,7 +113,12 @@ MdnsResponder::MdnsResponder(Loop &loop, std::string host, std::string service, 
 }
 
 MdnsResponder::~MdnsResponder() {
-  for (uint64_t t : timers_) loop_.cancel_timer(t);
+  for (uint64_t t : {poll_timer_, change_timer_, announce_timers_[0], announce_timers_[1]})
+    if (t) loop_.cancel_timer(t);
+  if (nl_fd_ >= 0) {
+    loop_.del_fd(nl_fd_);
+    close(nl_fd_);
+  }
   if (fd_ >= 0) {
     announce(true);
     loop_.del_fd(fd_);
@@ -147,10 +154,20 @@ void MdnsResponder::set_txt(const std::string &service, std::vector<std::string>
   }
 }
 
+// RFC 6762 8.3: at least two announcements one second apart; three, spaced 1 s and 2 s, also
+// cover a Wi-Fi link that is still settling after a reconnect.
 void MdnsResponder::schedule_announcements() {
   announce(false);
-  timers_.push_back(loop_.add_timer(1000, [this] { announce(false); }));
-  timers_.push_back(loop_.add_timer(3000, [this] { announce(false); }));
+  for (uint64_t &t : announce_timers_)
+    if (t) loop_.cancel_timer(t);
+  announce_timers_[0] = loop_.add_timer(1000, [this] {
+    announce_timers_[0] = 0;
+    announce(false);
+  });
+  announce_timers_[1] = loop_.add_timer(3000, [this] {
+    announce_timers_[1] = 0;
+    announce(false);
+  });
 }
 
 bool MdnsResponder::refresh_iface() {
@@ -187,6 +204,7 @@ bool MdnsResponder::refresh_iface() {
     ifname_ = best->ifa_name;
   } else {
     changed = ip_ != 0;
+    if (changed) LOGI("mdns: no usable IPv4 address");
     ip_ = 0;
     ifindex_ = 0;
     ifname_.clear();
@@ -195,16 +213,95 @@ bool MdnsResponder::refresh_iface() {
   return changed;
 }
 
+// Re-asserted on every check: after a Wi-Fi reconnect the driver may have dropped the
+// membership (or recreated wlan0) while the address stayed the same; EADDRINUSE = still joined.
 void MdnsResponder::join_group() {
   if (!ifindex_) return;
   ip_mreqn mreq{};
   inet_pton(AF_INET, kMdnsGroup, &mreq.imr_multiaddr);
   mreq.imr_address.s_addr = ip_;
   mreq.imr_ifindex = ifindex_;
-  if (setsockopt(fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof mreq) != 0 && errno != EADDRINUSE)
-    LOGW("mdns: IP_ADD_MEMBERSHIP on %s: %s", ifname_.c_str(), strerror(errno));
+  bool failed = setsockopt(fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof mreq) != 0 && errno != EADDRINUSE;
+  if (failed && !join_failed_) LOGW("mdns: IP_ADD_MEMBERSHIP on %s: %s", ifname_.c_str(), strerror(errno));
+  if (!failed && join_failed_) LOGI("mdns: joined the multicast group on %s", ifname_.c_str());
+  join_failed_ = failed;
   if (setsockopt(fd_, IPPROTO_IP, IP_MULTICAST_IF, &mreq, sizeof mreq) != 0)
-    LOGW("mdns: IP_MULTICAST_IF: %s", strerror(errno));
+    LOGD("mdns: IP_MULTICAST_IF: %s", strerror(errno));
+}
+
+void MdnsResponder::check_network(bool force_announce) {
+  int old_idx = ifindex_;
+  uint32_t old_ip = ip_;
+  bool changed = refresh_iface();
+  if (changed && old_idx) {
+    ip_mreqn mreq{};
+    inet_pton(AF_INET, kMdnsGroup, &mreq.imr_multiaddr);
+    mreq.imr_address.s_addr = old_ip;
+    mreq.imr_ifindex = old_idx;
+    setsockopt(fd_, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof mreq);
+  }
+  join_group();
+  if (changed || force_announce) schedule_announcements();
+}
+
+bool MdnsResponder::open_netlink() {
+  nl_fd_ = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_ROUTE);
+  if (nl_fd_ < 0) return false;
+  sockaddr_nl sa{};
+  sa.nl_family = AF_NETLINK;
+  sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR;
+  if (bind(nl_fd_, reinterpret_cast<sockaddr *>(&sa), sizeof sa) != 0) {
+    close(nl_fd_);
+    nl_fd_ = -1;
+    return false;
+  }
+  loop_.add_fd(nl_fd_, EPOLLIN, [this](uint32_t) { on_netlink(); });
+  return true;
+}
+
+// Address changes always count. Link messages also carry wireless events (scans, roaming
+// noise), so only a change of the up/running state counts. A burst (DHCP renew, reconnect) is
+// handled once, after it settles.
+void MdnsResponder::on_netlink() {
+  alignas(nlmsghdr) char buf[8192];
+  bool relevant = false, link_up = false;
+  for (;;) {
+    ssize_t n = recv(nl_fd_, buf, sizeof buf, 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == ENOBUFS) relevant = link_up = true;  // overflowed: something happened, recheck
+      break;
+    }
+    int len = int(n);
+    for (auto *h = reinterpret_cast<nlmsghdr *>(buf); NLMSG_OK(h, len); h = NLMSG_NEXT(h, len)) {
+      if (h->nlmsg_type == RTM_NEWADDR || h->nlmsg_type == RTM_DELADDR) {
+        auto *ifa = static_cast<ifaddrmsg *>(NLMSG_DATA(h));
+        if (ifa->ifa_family == AF_INET) relevant = true;
+      } else if (h->nlmsg_type == RTM_NEWLINK || h->nlmsg_type == RTM_DELLINK) {
+        auto *ifi = static_cast<ifinfomsg *>(NLMSG_DATA(h));
+        unsigned flags = h->nlmsg_type == RTM_DELLINK ? 0 : ifi->ifi_flags & (IFF_UP | IFF_RUNNING);
+        auto it = std::find_if(link_flags_.begin(), link_flags_.end(),
+                               [&](const auto &p) { return p.first == ifi->ifi_index; });
+        if (it == link_flags_.end()) {
+          link_flags_.emplace_back(ifi->ifi_index, flags);
+          relevant = true;
+        } else if (it->second != flags) {
+          it->second = flags;
+          relevant = true;
+        }
+        if (flags == (IFF_UP | IFF_RUNNING)) link_up = true;
+      }
+    }
+  }
+  if (!relevant) return;
+  change_forced_ = change_forced_ || link_up;
+  if (change_timer_) return;
+  change_timer_ = loop_.add_timer(1500, [this] {
+    change_timer_ = 0;
+    bool force = change_forced_;
+    change_forced_ = false;
+    check_network(force);
+  });
 }
 
 bool MdnsResponder::start() {
@@ -239,24 +336,9 @@ bool MdnsResponder::start() {
   loop_.add_fd(fd_, EPOLLIN, [this](uint32_t) { on_readable(); });
 
   schedule_announcements();
-  // Track DHCP/roaming changes of the interface address.
-  timers_.push_back(loop_.add_timer(
-      30000,
-      [this] {
-        int old_idx = ifindex_;
-        uint32_t old_ip = ip_;
-        if (!refresh_iface()) return;
-        if (old_idx) {
-          ip_mreqn mreq{};
-          inet_pton(AF_INET, kMdnsGroup, &mreq.imr_multiaddr);
-          mreq.imr_address.s_addr = old_ip;
-          mreq.imr_ifindex = old_idx;
-          setsockopt(fd_, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof mreq);
-        }
-        join_group();
-        announce(false);
-      },
-      30000));
+  if (!open_netlink()) LOGW("mdns: rtnetlink unavailable (%s); relying on the 30 s poll", strerror(errno));
+  // Fallback for missed netlink events; announces only on an actual change.
+  poll_timer_ = loop_.add_timer(30000, [this] { check_network(false); }, 30000);
   for (const auto &s : services_) LOGI("mdns: advertising %s port %u", s.instance_fqdn.c_str(), s.port);
   return true;
 }
