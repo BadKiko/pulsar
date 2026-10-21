@@ -6,12 +6,15 @@
 # Without addresses: finds Yandex Stations via mDNS (avahi-browse) or, with --scan or without
 # avahi, by scanning the /24 of every default-route interface for adb (port 5555); connects,
 # identifies the model and offers the supported, rooted stations found. Per station:
-# - copies the daemon + scripts to /data/cucumber-satellite (the previous binary is kept as .prev);
+# - copies the daemon + scripts to /data/cucumber-satellite (scripts via .new + mv; when the binary
+#   differs from the installed one, the installed one is kept as .prev; an identical one is not
+#   copied and leaves .prev alone);
 # - --ssh also installs dropbear (static build from ssh/build.sh) to /data/dropbear;
 # - adds the boot hooks to /data/quasar/rootkeeper.sh (backup: rootkeeper.sh.bak-<timestamp>),
 #   placed before an endless `while` loop if the script has one, otherwise appended;
 # - enables the satellite (stops the Yandex stack) unless --no-enable; an already running
-#   satellite is restarted with the new binary.
+#   satellite is restarted with the new binary and, after ~10 s, checked (process alive, no crash
+#   report in the log); on failure the previous binary is put back (asked, or automatic with --yes).
 # Missing build outputs are built first. Nothing outside /data is modified. Re-running is safe.
 # --list only shows what was found; --yes installs to every station found without asking.
 # --scan may reach other Android devices on the network, which can show an adb authorization prompt.
@@ -28,6 +31,8 @@ HOOK_SSH='[ -x /data/dropbear/start.sh ] && /data/dropbear/start.sh </dev/null >
 # model-specific hardware (mic array + VQE preset, LED framebuffers, clock, inputs).
 declare -A MODEL_NAME=([cucumber]="Yandex Station Midi" [plum]="Yandex Station Lite 2")
 SUPPORTED=" cucumber "
+# Build output (build/<arch>/cucumber-satellite) for each model's userland.
+declare -A MODEL_ARCH=([cucumber]=aarch64 [plum]=armhf)
 
 SSH=0 ENABLE=1 YES=0 LIST=0 SCAN=0
 TARGETS=()
@@ -96,6 +101,7 @@ mdns() {
 
 # Fills FOUND (installable serials) and prints one status line per probed device.
 FOUND=()
+declare -A FOUND_ARCH=()
 probe() { # serial connected_by_us
   local s=$1 ours=$2 compat code name state
   if ! compat=$(sh_ "$s" "tr '\\0' ' ' </proc/device-tree/compatible"); then
@@ -129,26 +135,42 @@ probe() { # serial connected_by_us
   elif sh_ "$s" "[ -x $D/cucumber-satellite ]"; then state="satellite installed, not running"
   else state="stock Yandex"; fi
   FOUND+=("$s")
+  FOUND_ARCH[$s]=${MODEL_ARCH[$code]}
   echo "  [${#FOUND[@]}] $s: $name — $state"
 }
 
 # errexit does not apply inside a function called from `||`: every step checks its own status.
 install_one() { # serial
-  local s=$1 want got hooks tmp f
+  local s=$1 bin want got have hooks tmp f changed=1
+  bin=$SAT/build/${FOUND_ARCH[$s]}/cucumber-satellite
+  [ -s "$bin" ] || { echo "$s: $bin missing" >&2; return 1; }
   echo "== $s: daemon"
   sh_ "$s" "mkdir -p $D" || return 1
-  adb -s "$s" push "$SAT/build/cucumber-satellite" "$D/cucumber-satellite.new" >/dev/null || return 1
-  for f in boot.sh supervise.sh ctl.sh; do adb -s "$s" push "$SAT/deploy/$f" "$D/$f" >/dev/null || return 1; done
-  want=$(sha256sum "$SAT/build/cucumber-satellite" | cut -d' ' -f1)
-  got=$(sh_ "$s" "sha256sum $D/cucumber-satellite.new" | cut -d' ' -f1)
-  if [ "$want" != "$got" ]; then
-    sh_ "$s" "rm -f $D/cucumber-satellite.new" || true
-    echo "$s: push corrupted (sha256 mismatch), nothing changed" >&2
-    return 1
+  want=$(sha256sum "$bin" | cut -d' ' -f1)
+  have=$(sh_ "$s" "[ -f $D/cucumber-satellite ] && sha256sum $D/cucumber-satellite" | cut -d' ' -f1 || true)
+  if [ "$want" = "$have" ]; then
+    echo "binary identical to the installed one, not copied (.prev kept)"
+    changed=0
+  else
+    adb -s "$s" push "$bin" "$D/cucumber-satellite.new" >/dev/null || return 1
+    got=$(sh_ "$s" "sha256sum $D/cucumber-satellite.new" | cut -d' ' -f1)
+    if [ "$want" != "$got" ]; then
+      sh_ "$s" "rm -f $D/cucumber-satellite.new" || true
+      echo "$s: push corrupted (sha256 mismatch), nothing changed" >&2
+      return 1
+    fi
   fi
-  sh_ "$s" "cd $D && chmod 755 cucumber-satellite.new boot.sh supervise.sh ctl.sh &&
-     { [ ! -f cucumber-satellite ] || cp -p cucumber-satellite cucumber-satellite.prev; } &&
-     mv cucumber-satellite.new cucumber-satellite && sync" || return 1
+  # Scripts: a running shell reads its script incrementally, so replace them atomically (new inode).
+  for f in boot.sh supervise.sh ctl.sh; do adb -s "$s" push "$SAT/deploy/$f" "$D/$f.new" >/dev/null || return 1; done
+  sh_ "$s" "cd $D && chmod 755 boot.sh.new supervise.sh.new ctl.sh.new &&
+     mv boot.sh.new boot.sh && mv supervise.sh.new supervise.sh && mv ctl.sh.new ctl.sh" || return 1
+  if [ $changed = 1 ]; then
+    sh_ "$s" "cd $D && chmod 755 cucumber-satellite.new &&
+       { [ ! -f cucumber-satellite ] || cp -p cucumber-satellite cucumber-satellite.prev; } &&
+       mv cucumber-satellite.new cucumber-satellite && sync" || return 1
+  else
+    sh_ "$s" "sync" || true
+  fi
 
   if [ $SSH = 1 ]; then
     echo "== $s: dropbear"
@@ -198,10 +220,35 @@ install_one() { # serial
     echo "== $s: start"
     if sh_ "$s" "pidof cucumber-satellite >/dev/null"; then sh_ "$s" "$D/ctl.sh restart"; else sh_ "$s" "$D/ctl.sh enable"; fi
     echo
-    sleep 8
+    health_check "$s" "$changed" || return 1
     sh_ "$s" "$D/ctl.sh status; $D/ctl.sh log 5"
     echo
   fi
+}
+
+# After a (re)start: the process must be alive after ~10 s and the log since the last start must
+# have neither a crash report nor an exit. On failure, offer to put the previous binary back.
+health_check() { # serial binary_changed
+  local s=$1 changed=$2 log ans
+  sleep 10
+  log=$(sh_ "$s" "tail -n 300 /tmp/cucumber-satellite.log" || true)
+  log=${log##*=== start}
+  if sh_ "$s" "pidof cucumber-satellite >/dev/null" && [[ $log != *"=== CRASH"* && $log != *"=== exit"* && $log != *"=== supervise"* ]]; then
+    echo "$s: health check ok"
+    return 0
+  fi
+  echo "$s: health check FAILED, log:" >&2
+  printf '%s\n' "$log" | tail -n 15 >&2
+  if [ "$changed" = 1 ] && sh_ "$s" "[ -f $D/cucumber-satellite.prev ]"; then
+    ans=y
+    [ $YES = 1 ] || read -r -p "roll back to the previous binary? [Y/n] " ans </dev/tty
+    if [[ ${ans:-y} != [nN]* ]]; then
+      sh_ "$s" "cd $D && cp -p cucumber-satellite.prev cucumber-satellite.rb && mv cucumber-satellite cucumber-satellite.bad &&
+        mv cucumber-satellite.rb cucumber-satellite && sync && ./ctl.sh restart" || true
+      echo "$s: rolled back (bad binary kept as $D/cucumber-satellite.bad)" >&2
+    fi
+  fi
+  return 1
 }
 
 command -v adb >/dev/null || { echo "adb not found (Android platform-tools)" >&2; exit 1; }
