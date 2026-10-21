@@ -46,6 +46,7 @@ class Controller : public ApiHooks {
   void on_light(const LightState &st) override;
   void on_number(NumberId id, float value) override;
   void on_time(uint32_t epoch_seconds, const std::string &posix_tz) override;
+  void on_restart() override;
 
  private:
   enum class Phase { IDLE, LISTENING, PROCESSING, SPEAKING };

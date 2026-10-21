@@ -615,6 +615,11 @@ void Controller::on_media_command(const MediaCommandRequest &cmd) {
 
 // ---------------- entities ----------------
 
+void Controller::on_restart() {
+  LOGW("restart requested from Home Assistant");
+  loop_.stop();
+}
+
 void Controller::on_switch(SwitchId id, bool state) {
   if (id == SwitchId::MIC_MUTE) {
     st_.mic_muted = state;
