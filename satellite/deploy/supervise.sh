@@ -3,20 +3,27 @@
 # Log: /tmp/cucumber-satellite.log (tmpfs, rotated at 1 MB, one .1 kept).
 #
 # Exit status of the daemon: 0 = deliberate exit (SIGTERM from ctl.sh restart, the "Restart" button
-# in Home Assistant): restart after 1 s, not counted as a crash unless it ran < MINUP seconds.
-# Anything else (non-zero, killed by a signal, e.g. 139 = SIGSEGV) is a crash, restart after 3 s.
-# CRASHES crashes within WINDOW seconds: swap in cucumber-satellite.prev (the bad binary is kept as
-# .bad) and try again; if that crash-loops too, remove `enabled` and give the speaker back to the
-# Yandex stack (same as `ctl.sh disable`).
+# in Home Assistant): restart after 1 s, neither counted nor forgiven as a crash unless it ran
+# < MINUP seconds. Anything else (non-zero, killed by a signal, e.g. 139 = SIGSEGV) is a crash.
+# A "short crash" is one after a run of < LONG seconds. CRASHES consecutive short crashes: swap in
+# cucumber-satellite.prev (the bad binary is kept as .bad) and try again; if that crash-loops too,
+# remove `enabled` and give the speaker back to the Yandex stack (same as `ctl.sh disable`).
+# Only a run of >= LONG seconds resets the count. Restart delay after a crash: 3 s, doubling up
+# to 30 s.
 # CS_DIR, CS_LOG, CS_Q override the device paths (local dry runs).
 D=${CS_DIR:-/data/cucumber-satellite}
 LOG=${CS_LOG:-/tmp/cucumber-satellite.log}
 Q=${CS_Q:-/system/vendor/quasar/q}
 BIN=$D/cucumber-satellite
 MAXLOG=1000000
-WINDOW=60
+LONG=${CS_LONG:-300}
 CRASHES=5
 MINUP=5
+BACKOFF_MIN=3
+BACKOFF_MAX=30
+
+# Seconds since boot: unaffected by clock steps (NTP / time from Home Assistant).
+uptime_s() { read -r u _ < /proc/uptime; echo "${u%%.*}"; }
 
 # Copy-truncate: the daemon keeps its append-mode descriptor, so a rename would not stop growth.
 rotate() {
@@ -36,9 +43,11 @@ give_back() { # Yandex stack again, like ctl.sh disable
 
 ( while sleep 60; do rotate; done ) &
 ROT=$!
+# busybox ash does not run an EXIT trap on SIGTERM: clean up in the signal traps themselves.
+trap 'kill $ROT 2>/dev/null; exit 143' TERM INT HUP
 trap 'kill $ROT 2>/dev/null' EXIT
 
-fails=0 first=0 swapped=0
+fails=0 swapped=0 backoff=$BACKOFF_MIN
 while [ -f "$D/enabled" ]; do
   rotate
   if [ ! -x "$BIN" ]; then
@@ -49,33 +58,36 @@ while [ -f "$D/enabled" ]; do
     give_back "no usable binary"
   fi
   echo "=== start $(date)" >> "$LOG"
-  t0=$(date +%s)
+  t0=$(uptime_s)
   "$BIN" "$D/state.conf" >> "$LOG" 2>&1
   rc=$?
-  now=$(date +%s)
-  up=$((now - t0))
+  up=$(($(uptime_s) - t0))
   echo "=== exit $rc after ${up}s $(date)" >> "$LOG"
 
+  if [ $up -ge $LONG ]; then
+    fails=0 swapped=0 backoff=$BACKOFF_MIN
+    [ $rc -eq 0 ] && sleep 1 || sleep $backoff
+    continue
+  fi
   if [ $rc -eq 0 ] && [ $up -ge $MINUP ]; then
-    [ $up -ge $WINDOW ] && swapped=0
-    fails=0
     sleep 1
     continue
   fi
-  [ $up -ge $WINDOW ] && { fails=0; swapped=0; }
-  if [ $fails -eq 0 ] || [ $((now - first)) -gt $WINDOW ]; then first=$now; fails=0; fi
   fails=$((fails + 1))
   if [ $fails -ge $CRASHES ]; then
     if [ "$swapped" = 0 ] && [ -f "$BIN.prev" ] && ! cmp -s "$BIN" "$BIN.prev"; then
       mv -f "$BIN" "$BIN.bad"
       if cp -p "$BIN.prev" "$BIN.tmp" && mv "$BIN.tmp" "$BIN"; then
-        swapped=1 fails=0
-        say "$CRASHES crashes in ${WINDOW}s, rolled back to .prev (bad binary kept as .bad)"
+        swapped=1 fails=0 backoff=$BACKOFF_MIN
+        say "$CRASHES short crashes in a row, rolled back to .prev (bad binary kept as .bad)"
         continue
       fi
       mv -f "$BIN.bad" "$BIN"
     fi
-    give_back "$CRASHES crashes in ${WINDOW}s, no previous binary to fall back to"
+    if [ "$swapped" = 1 ]; then give_back "$CRASHES short crashes in a row, also with the rolled-back .prev"
+    else give_back "$CRASHES short crashes in a row, no different previous binary to fall back to"; fi
   fi
-  sleep 3
+  sleep $backoff
+  backoff=$((backoff * 2))
+  [ $backoff -gt $BACKOFF_MAX ] && backoff=$BACKOFF_MAX
 done
