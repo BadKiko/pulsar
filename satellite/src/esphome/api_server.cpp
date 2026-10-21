@@ -51,6 +51,7 @@ enum Msg : uint32_t {
   SENSOR_STATE = 25,
   SWITCH_STATE = 26,
   SUBSCRIBE_LOGS_REQ = 28,
+  SUBSCRIBE_LOGS_RESP = 29,
   LIGHT_CMD = 32,
   SWITCH_CMD = 33,
   SUBSCRIBE_HA_SERVICES_REQ = 34,
@@ -249,6 +250,7 @@ struct ApiServer::Impl {
     int64_t last_rx = 0;
     bool ping_outstanding = false;
     int64_t last_time_req = 0;
+    uint32_t log_level = 0;  // SubscribeLogsRequest level (ESPHome LogLevel), 0 = none
     Proto proto = Proto::UNKNOWN;
     NoiseStep step = NoiseStep::CLIENT_HELLO;
     NoiseHandshakeState *hs = nullptr;
@@ -283,6 +285,9 @@ struct ApiServer::Impl {
   // key without sending it in the clear (protects against sniffing only).
   Psk psk{};
   bool has_key = false;
+  // Log lines are produced on any thread; the sink only posts a drain to the loop. The token
+  // lets a drain posted just before destruction see that the server is gone.
+  std::shared_ptr<bool> alive = std::make_shared<bool>(true);
 
   // Cached entity state (replayed on SubscribeStatesRequest).
   MediaState media_state = MediaState::IDLE;
@@ -296,6 +301,7 @@ struct ApiServer::Impl {
 
   // Runs while the owner is being torn down: no hooks from here.
   ~Impl() {
+    log_set_sink(4, nullptr);
     if (tick_timer) loop.cancel_timer(tick_timer);
     for (auto &c : clients) {
       loop.del_fd(c->fd);
@@ -506,9 +512,42 @@ struct ApiServer::Impl {
     c->fd = -1;
     clients.erase(std::remove(clients.begin(), clients.end(), c), clients.end());
     LOGI("api: %s %s (%s)", c->peer.c_str(), c->hello ? "disconnected" : "dropped", why);
+    if (c->log_level) update_log_sink();
     if (!c->hello) return;
     if (c->voice) hooks.on_voice_subscribed(false);
     if (!ready()) hooks.on_client_disconnected();
+  }
+
+  // Our levels 0..3 (D, I, W, E) <-> ESPHome LogLevel (DEBUG 5, INFO 3, WARN 2, ERROR 1).
+  static uint32_t esphome_level(int level) {
+    static const uint32_t map[] = {5, 3, 2, 1};
+    return map[level & 3];
+  }
+
+  void update_log_sink() {
+    uint32_t want = 0;
+    for (const auto &c : clients)
+      if (c->hello) want = std::max(want, c->log_level);
+    if (!want) return log_set_sink(4, nullptr);
+    int min = want >= 5 ? 0 : want >= 3 ? 1 : want == 2 ? 2 : 3;
+    std::weak_ptr<bool> token = alive;
+    log_set_sink(min, [this, token] {
+      loop.post([this, token] {
+        if (token.lock()) drain_logs();
+      });
+    });
+  }
+
+  void drain_logs() {
+    for (const LogLine &l : log_take()) {
+      uint32_t lvl = esphome_level(l.level);
+      pb::Writer w;
+      w.u32(1, lvl, true);
+      w.str(3, l.text, true);
+      auto snapshot = clients;
+      for (const auto &c : snapshot)
+        if (c->hello && c->log_level >= lvl) send_msg(c, SUBSCRIBE_LOGS_RESP, w);
+    }
   }
 
   // A client completing hello at the cap replaces the established client heard from least
@@ -931,7 +970,15 @@ struct ApiServer::Impl {
         c->states = true;
         send_all_states(c);
         break;
-      case SUBSCRIBE_LOGS_REQ:
+      case SUBSCRIBE_LOGS_REQ: {
+        uint32_t level = 0;
+        while (r.next(f))
+          if (f.num == 1) level = f.u32();
+        LOGI("api: %s log subscription, level %u", c->peer.c_str(), level);
+        c->log_level = level;
+        update_log_sink();
+        break;
+      }
       case SUBSCRIBE_HA_SERVICES_REQ:
       case SUBSCRIBE_HA_STATES_REQ:
         break;
