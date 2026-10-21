@@ -678,7 +678,12 @@ struct ApiServer::Impl {
             else
               LOGW("api: ignoring wake word '%s'", ww.c_str());
           }
-        cfg.active_wake_words = ids;
+        // The spotter always runs one model: an empty/unknown selection leaves the current word
+        // active, and the controller reports a switch back through set_active_wake_words().
+        if (ids.empty()) {
+          LOGW("api: no known wake word in the new configuration, keeping the current one");
+          break;
+        }
         hooks.on_active_wake_words(ids);
         break;
       }

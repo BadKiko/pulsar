@@ -110,7 +110,8 @@ class ApiHooks {
   virtual void on_voice_event(VaEvent type, const std::map<std::string, std::string> &data) = 0;
   virtual void on_announce(const AnnounceRequest &req) = 0;
   virtual void on_timer_event(const TimerInfo &t) = 0;
-  // HA changed active wake words (VoiceAssistantSetConfiguration).
+  // HA changed active wake words (VoiceAssistantSetConfiguration); ids are known and non-empty.
+  // The reported active set changes only through ApiServer::set_active_wake_words().
   virtual void on_active_wake_words(const std::vector<std::string> &ids) = 0;
   virtual void on_media_command(const MediaCommandRequest &cmd) = 0;
   virtual void on_switch(SwitchId id, bool state) = 0;
