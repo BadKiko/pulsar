@@ -59,20 +59,36 @@ SS_LIBS  := $(SS_BUILD)/sendspin/libsendspin.a \
             $(SS_BUILD)/_deps/ixwebsocket-build/libixwebsocket.a \
             $(SS_BUILD)/sendspin/libnoise_c.a
 
-# No debug info: the Lite 2 has ~80 MB of /data for the binary, its .prev and the upload.
+# The deployed binary is stripped (the Lite 2 has ~80 MB of /data for the binary, its .prev and the
+# upload); the unstripped link, with line tables, is kept as build/<arch>/cucumber-satellite.debug
+# for `addr2line -f -e` on the crash report that main.cpp writes to the log.
 # -Wno-date-time: the build date is reported to Home Assistant as compilation_time.
 CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-date-time -Isrc -I$(SYSROOT)/include \
-            -isystem $(SS_SRC)/sendspin-cpp/include $(SS_DEFS) -fno-omit-frame-pointer
-LDFLAGS  := -s -L$(SYSROOT)/lib -Wl,--start-group $(SS_LIBS) -Wl,--end-group -lasound -ldl -lpthread
+            -isystem $(SS_SRC)/sendspin-cpp/include $(SS_DEFS) -fno-omit-frame-pointer -g1
+LDFLAGS  := -L$(SYSROOT)/lib -Wl,--start-group $(SS_LIBS) -Wl,--end-group -lasound -ldl -lpthread
 
 SRCS := $(shell find src -name '*.cpp')
 OBJS := $(patsubst src/%.cpp,$(BUILD)/%.o,$(SRCS))
 DEPS := $(OBJS:.o=.d)
 
+# Reported by `cucumber-satellite --version` and Home Assistant. Only main.o and controller.o see it;
+# the stamp changes (and they rebuild) only when the version string does.
+VERSION := $(shell git describe --always --dirty 2>/dev/null || echo unknown)
+VERSION_STAMP := $(BUILD)/version.stamp
+$(BUILD)/main.o $(BUILD)/controller.o: CXXFLAGS += -DCS_VERSION='"$(VERSION)"'
+$(BUILD)/main.o $(BUILD)/controller.o: $(VERSION_STAMP)
+
+$(VERSION_STAMP): FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(VERSION)' | cmp -s - $@ || echo '$(VERSION)' > $@
+
 binary: $(BUILD)/cucumber-satellite
 
-$(BUILD)/cucumber-satellite: $(OBJS) $(SS_STAMP)
+$(BUILD)/cucumber-satellite.debug: $(OBJS) $(SS_STAMP)
 	$(CXX) $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD)/cucumber-satellite: $(BUILD)/cucumber-satellite.debug
+	$(ZIG) objcopy --strip-all $< $@
 
 $(BUILD)/%.o: src/%.cpp | $(SS_STAMP) $(SYSROOT_STAMP)
 	@mkdir -p $(dir $@)
@@ -99,7 +115,8 @@ $(BUILD)/tools/%: tools/%.cpp $(filter-out $(BUILD)/main.o,$(OBJS)) $(SS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $< $(filter-out $(BUILD)/main.o,$(OBJS)) -o $@ $(LDFLAGS)
 
-.PHONY: binary
+.PHONY: binary FORCE
+FORCE:
 -include $(DEPS)
 
 endif

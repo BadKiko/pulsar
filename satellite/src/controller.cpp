@@ -116,7 +116,7 @@ bool Controller::start() {
   id.mac = mac;
   id.model = "Yandex Station Midi";
   id.manufacturer = "Yandex";
-  id.project_version = "0.1.0";
+  id.project_version = CS_VERSION;
 
   ApiConfig cfg;
   cfg.wake_words = {{"alisa", "Алиса", {"ru"}}, {"yandex", "Яндекс", {"ru"}}};

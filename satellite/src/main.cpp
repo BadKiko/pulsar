@@ -1,16 +1,127 @@
 // cucumber-satellite: Home Assistant voice satellite for Yandex Station Midi.
-// usage: cucumber-satellite [state_file]
+// usage: cucumber-satellite [--version | state_file]
+#include <execinfo.h>
 #include <signal.h>
 #include <sys/signalfd.h>
+#include <ucontext.h>
 #include <unistd.h>
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <thread>
 
 #include "controller.h"
 #include "core/log.h"
 #include "core/loop.h"
 
+#ifndef CS_VERSION
+#define CS_VERSION "unknown"
+#endif
+
+namespace {
+
+// Teardown (Sendspin threads, GStreamer, ALSA) runs with SIGTERM blocked and has hung before:
+// give it a few seconds, then leave with the status main() was about to return (0 = deliberate
+// exit for supervise.sh).
+constexpr int kTeardownSeconds = 5;
+
+void arm_teardown_watchdog(int status) {
+  std::thread([status] {
+    sleep(kTeardownSeconds);
+    static const char msg[] = "teardown did not finish in 5 s, _exit\n";
+    if (write(2, msg, sizeof msg - 1) < 0) {}
+    _exit(status);
+  }).detach();
+}
+
+// Crash report straight to stderr (the log file): everything here is async-signal-safe. The binary
+// is stripped; resolve the addresses with `addr2line -f -e build/<arch>/cucumber-satellite.debug`
+// (non-PIE: addresses are absolute).
+void put(const char *s) {
+  if (write(2, s, strlen(s)) < 0) {}
+}
+
+void put_hex(const char *label, uintptr_t v) {
+  char b[40];
+  size_t n = 0;
+  for (const char *p = label; *p; p++) b[n++] = *p;
+  b[n++] = '0';
+  b[n++] = 'x';
+  bool started = false;
+  for (int shift = int(sizeof v) * 8 - 4; shift >= 0; shift -= 4) {
+    unsigned d = unsigned(v >> shift) & 0xf;
+    if (!d && !started && shift) continue;
+    started = true;
+    b[n++] = "0123456789abcdef"[d];
+  }
+  b[n++] = ' ';
+  if (write(2, b, n) < 0) {}
+}
+
+void crash_handler(int sig, siginfo_t *si, void *uc_) {
+  auto *uc = static_cast<ucontext_t *>(uc_);
+  put("\n=== CRASH ");
+  put(sig == SIGSEGV ? "SIGSEGV " : sig == SIGBUS ? "SIGBUS " : sig == SIGABRT ? "SIGABRT " : "signal ");
+  put_hex("addr=", uintptr_t(si->si_addr));
+#if defined(__aarch64__)
+  put_hex("pc=", uintptr_t(uc->uc_mcontext.pc));
+  put_hex("lr=", uintptr_t(uc->uc_mcontext.regs[30]));
+#elif defined(__arm__)
+  put_hex("pc=", uintptr_t(uc->uc_mcontext.arm_pc));
+  put_hex("lr=", uintptr_t(uc->uc_mcontext.arm_lr));
+#endif
+  put_hex("handler=", uintptr_t(&crash_handler));
+  put("\n");
+  void *fr[40];
+  int n = backtrace(fr, 40);
+  for (int i = 0; i < n; i++) put_hex(i ? "" : "bt: ", uintptr_t(fr[i]));
+  put("\n");
+#if defined(__aarch64__)
+  if (n < 3) {  // no libgcc_s on the device: walk the frame-pointer chain (-fno-omit-frame-pointer)
+    auto *fp = reinterpret_cast<uintptr_t *>(uc->uc_mcontext.regs[29]);
+    put("fp: ");
+    for (int i = 0; i < 40 && fp && !(uintptr_t(fp) & 15); i++) {
+      uintptr_t ret = fp[1], next = fp[0];
+      if (!ret) break;
+      put_hex("", ret);
+      if (next <= uintptr_t(fp)) break;
+      fp = reinterpret_cast<uintptr_t *>(next);
+    }
+    put("\n");
+  }
+#endif
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+void install_crash_handler() {
+  // Own stack: a stack overflow must still produce a report. The backtrace unwinder loads
+  // libgcc_s lazily (not async-signal-safe): do it once now.
+  static char altstack[64 * 1024];
+  stack_t ss{};
+  ss.ss_sp = altstack;
+  ss.ss_size = sizeof altstack;
+  sigaltstack(&ss, nullptr);
+  void *warm[4];
+  backtrace(warm, 4);
+  struct sigaction sa{};
+  sa.sa_sigaction = crash_handler;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND | SA_NODEFER;
+  sigemptyset(&sa.sa_mask);
+  for (int s : {SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL}) sigaction(s, &sa, nullptr);
+}
+
+}  // namespace
+
 int main(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "--version")) {
+    printf("cucumber-satellite %s\n", CS_VERSION);
+    return 0;
+  }
   const char *state = argc > 1 ? argv[1] : "/data/cucumber-satellite/state.conf";
   signal(SIGPIPE, SIG_IGN);
+  install_crash_handler();
 
   cs::Loop loop;
   sigset_t mask;
@@ -28,8 +139,12 @@ int main(int argc, char **argv) {
   });
 
   cs::Controller ctl(loop, state);
-  if (!ctl.start()) return 1;
-  LOGI("cucumber-satellite running");
+  if (!ctl.start()) {
+    arm_teardown_watchdog(1);
+    return 1;
+  }
+  LOGI("cucumber-satellite %s running", CS_VERSION);
   loop.run();
-  return 0;
+  arm_teardown_watchdog(0);
+  return 0;  // ~Controller runs here, under the watchdog
 }
