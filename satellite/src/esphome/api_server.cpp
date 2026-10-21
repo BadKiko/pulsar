@@ -329,6 +329,7 @@ struct ApiServer::Impl {
   uint32_t ip = 0;  // network byte order, as chosen by the mDNS responder
   const int64_t started_ms = Loop::now_ms();
   uint64_t diag_timer = 0;
+  uint64_t key_timer = 0;
 
   Impl(Loop &l, DeviceIdentity i, ApiConfig c, ApiHooks &h) : loop(l), id(std::move(i)), cfg(std::move(c)), hooks(h) {}
 
@@ -337,6 +338,7 @@ struct ApiServer::Impl {
     log_set_sink(4, nullptr);
     if (tick_timer) loop.cancel_timer(tick_timer);
     if (diag_timer) loop.cancel_timer(diag_timer);
+    if (key_timer) loop.cancel_timer(key_timer);
     for (auto &c : clients) {
       loop.del_fd(c->fd);
       if (c->hello) {
@@ -479,7 +481,9 @@ struct ApiServer::Impl {
       }
       LOGI("api: encryption key set by client");
     }
-    loop.add_timer(100, [this] {
+    if (key_timer) loop.cancel_timer(key_timer);
+    key_timer = loop.add_timer(100, [this] {
+      key_timer = 0;
       load_key();
       if (mdns) mdns->set_txt("_esphomelib._tcp", txt_records());
       LOGW("api: encryption key changed, disconnecting all clients");
