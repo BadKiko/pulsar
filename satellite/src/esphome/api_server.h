@@ -20,6 +20,7 @@ struct DeviceIdentity {
   std::string friendly_name;  // e.g. "Яндекс Станция Миди"
   std::string mac;            // "AA:BB:CC:DD:EE:FF" (wlan0)
   std::string model;          // "Yandex Station Midi"
+  std::string board;          // devicetree codename, e.g. "cucumber"
   std::string manufacturer;   // "Yandex"
   std::string project_version;
 };

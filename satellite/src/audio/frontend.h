@@ -1,5 +1,5 @@
-// Microphone front-end: ALSA capture (hw:0,2: 4 PDM mics + 4 speaker-feedback channels, 96 kHz)
-// -> Yandex VQE (AEC / beamforming / noise reduction, preset "cucumber")
+// Microphone front-end: ALSA capture (mic + speaker-feedback channels, layout per Model)
+// -> Yandex VQE (AEC / beamforming / noise reduction, per-model preset)
 // -> Yandex phrase spotters (stock models from /system/vendor/quasar/spotter_models):
 //    the wake word ("Алиса"/"Яндекс") and, optionally, the command model ("стоп", "громче", ...).
 // Both engines come from the firmware's libyandex_evil.so (C API, loaded with dlopen).
@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "core/loop.h"
+#include "model.h"
 
 namespace cs {
 
@@ -25,7 +26,7 @@ class AudioFrontend {
   using CommandCb = std::function<void(const std::string &word)>;
   using AudioCb = std::function<void(const int16_t *pcm, size_t samples)>;  // 16 kHz mono
 
-  explicit AudioFrontend(Loop &loop);
+  AudioFrontend(Loop &loop, const Model &model);
   ~AudioFrontend();
 
   // model_dir: wake-word model, e.g. .../spotter_models/activation/alisa.
@@ -51,6 +52,7 @@ class AudioFrontend {
   void run();
 
   Loop &loop_;
+  const Model &model_;
   std::unique_ptr<Engine> eng_;
   std::thread thr_;
   std::atomic<bool> running_{false};

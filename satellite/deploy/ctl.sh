@@ -8,7 +8,16 @@ case "$1" in
   enable)
     touch "$D/enabled"
     $Q stop >/dev/null 2>&1
-    pidof supervise.sh >/dev/null 2>&1 || (setsid "$D/supervise.sh" </dev/null >/dev/null 2>&1 &)
+    if ! pidof supervise.sh >/dev/null 2>&1; then
+      # Ignore SIGHUP and wait until the supervisor runs: when called through `adb shell`, the
+      # session ends right after this script and would otherwise kill it before setsid() ran.
+      (trap '' HUP; exec setsid "$D/supervise.sh" </dev/null >/dev/null 2>&1) &
+      i=0
+      while [ $i -lt 30 ] && ! pidof supervise.sh >/dev/null 2>&1; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+    fi
     echo "enabled"
     ;;
   disable)

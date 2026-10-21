@@ -5,6 +5,8 @@
 D=/data/cucumber-satellite
 [ -f "$D/enabled" ] || exit 0
 pidof cucumber-satellite >/dev/null 2>&1 && exit 0
+# Supported models only (see src/model.cpp); anything else keeps the Yandex stack.
+tr '\0' '\n' </proc/device-tree/compatible | grep -qxE 'yandex,(cucumber|plum)' || exit 0
 
 # onboot.sh launches quasar right before calling us; wait for it, then stop it.
 i=0

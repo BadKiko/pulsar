@@ -10,6 +10,7 @@
 #include "esphome/api_server.h"
 #include "hw/hw.h"
 #include "media/player.h"
+#include "model.h"
 #include "sendspin/sendspin_service.h"
 
 namespace cs {
@@ -29,7 +30,7 @@ struct Settings {
 
 class Controller : public ApiHooks {
  public:
-  Controller(Loop &loop, const std::string &state_path);
+  Controller(Loop &loop, const Model &model, const std::string &state_path);
   ~Controller() override;
   bool start();
 
@@ -73,6 +74,7 @@ class Controller : public ApiHooks {
   std::string model_dir(const std::string &id) const;
 
   Loop &loop_;
+  const Model &model_;
   std::string state_path_;
   Settings st_;
   std::unique_ptr<ApiServer> api_;

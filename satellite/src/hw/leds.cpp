@@ -1,21 +1,19 @@
-// LED ring (24 RGB) + logo (6 RGB) of the Station Midi.
+// LED ring (+ logo) of the Station Midi (24 + 6 RGB) and Lite 2 (3 RGB, no logo); layout per Model.
 //
-// How the hardware is driven: the ring LEDs (two aw21036 chips, i2c 1-0034 "ringA" / 1-0035
-// "ringB") and the logo LEDs (aw21018, 1-0020) sit behind the kernel "ledfb-ring"/"ledfb-logo"
-// LED triggers, which expose them as framebuffers:
-//   /dev/fb0 "ring": 24x1, 24 bpp, rgba 8/16,8/8,8/0 -> bytes per pixel are B,G,R; pixel i = ring{i}
-//   /dev/fb1 "logo":  6x1, 24 bpp, same layout;       pixel i = logo{i}
-// A 72-byte pwrite() fills the ring framebuffer, but the ledfb driver pushes the framebuffer to
-// the LEDs at the *start* of each write/pan, i.e. a write is only shown on the next write or
-// FBIOPAN_DISPLAY (measured: sysfs brightness lags one write behind; a pan latches immediately).
-// So every frame is pwrite() + FBIOPAN_DISPLAY. Cost ~2.5 ms per ring update (i2c), far cheaper
-// than 72 sysfs writes. If the framebuffers are missing or the
-// triggers are not ledfb-*, we fall back to the per-channel sysfs brightness files kept open.
+// How the hardware is driven: the LEDs sit behind kernel LED triggers that expose them as
+// framebuffers (Midi: "ledfb-ring"/"ledfb-logo" -> /dev/fb0 "ring" 24x1, /dev/fb1 "logo" 6x1;
+// Lite 2: "led_ring_fb" -> /dev/fb0 "YNDX LED ring" 3x1), 24 bpp, rgba 8/16,8/8,8/0 -> bytes per
+// pixel are B,G,R; pixel i = the i-th sysfs LED of the strip.
+// On the Midi a pwrite() is only shown on the next write or FBIOPAN_DISPLAY (the ledfb driver
+// pushes the framebuffer at the *start* of each write/pan), so every frame is pwrite() +
+// FBIOPAN_DISPLAY. Cost ~2.5 ms per ring update (i2c), far cheaper than per-LED sysfs writes.
+// If the framebuffers are missing or the triggers are not active, we fall back to the
+// per-channel sysfs brightness files kept open.
 //
-// Ring index order: Yandex patterns (ledpatterns/ring/*.led, 24 RRGGBB columns per frame) anchor
-// their animations at ring0 and grow symmetrically to ring1/ring23 (mute.led, alice_thinking.led),
-// so ring0 is the "home" position; all animations here are relative to ring0 and go towards
-// increasing indices.
+// Ring index order: Yandex patterns (ledpatterns/ring/*.led, one RRGGBB column per LED) anchor
+// their animations at the first LED and grow symmetrically to its neighbours (mute.led,
+// alice_thinking.led), so LED 0 is the "home" position; all animations here are relative to it
+// and go towards increasing indices.
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
@@ -33,8 +31,7 @@ namespace cs {
 
 namespace {
 
-constexpr int kRing = 24;
-constexpr int kLogo = 6;
+constexpr float kCometLen24 = 7.f;    // thinking comet length on the 24-LED ring
 constexpr int kFrameMs = 33;          // ~30 fps while animating
 constexpr float kMaxScale = 0.8f;     // global cap: never drive LEDs above 80 % PWM
 constexpr int64_t kVolumeShowMs = 1500;
@@ -81,15 +78,16 @@ const Col kWake = rgb(120, 230, 255);
 }  // namespace
 
 struct Leds::Impl {
-  explicit Impl(Loop &l) : loop(l) {}
+  Impl(Loop &l, const Model &m) : loop(l), model(m), n(m.ring.count), nlogo(m.logo.count) {}
   Loop &loop;
+  const Model &model;
+  const int n, nlogo;  // ring / logo LED counts
 
   // output
   int fb_ring = -1, fb_logo = -1;
   fb_var_screeninfo var_ring{}, var_logo{};
-  std::vector<int> sysfs_fds;  // fallback: [ring r,g,b x24][logo r,g,b x6]
-  uint8_t last[(kRing + kLogo) * 3];
-  bool have_last = false;
+  std::vector<int> sysfs_fds;  // fallback: [ring r,g,b x n][logo r,g,b x nlogo]
+  std::vector<uint8_t> last;
 
   // state
   UiState state = UiState::IDLE;
@@ -110,46 +108,56 @@ struct Leds::Impl {
       if (fd >= 0) close(fd);
   }
 
-  static bool trigger_is(const std::string &led, const char *trig) {
+  static bool trigger_is(const std::string &led, const std::string &trig) {
     std::string t;
     if (!hwutil::read_file(std::string(kLedDir) + led + "/trigger", t)) return false;
-    return t.find(std::string("[") + trig + "]") != std::string::npos;
+    return t.find("[" + trig + "]") != std::string::npos;
+  }
+
+  std::string led_name(const Model::LedStrip &s, const char *color, int i) const {
+    return model.led_prefix + ":" + color + ":" + s.sysfs_kind + std::to_string(s.first_index + i);
+  }
+
+  // Opens one strip's framebuffer if its trigger is active and the fb has the expected name.
+  int open_strip_fb(const Model::LedStrip &s, fb_var_screeninfo &var) {
+    if (!trigger_is(led_name(s, "red", 0), s.trigger)) {
+      LOGW("leds: trigger %s not active on %s", s.trigger.c_str(), led_name(s, "red", 0).c_str());
+      return -1;
+    }
+    std::string name;
+    hwutil::read_file("/sys/class/graphics/" + s.fb_dev.substr(s.fb_dev.rfind('/') + 1) + "/name", name);
+    if (hwutil::trim(name) != s.fb_name) {
+      LOGW("leds: %s is '%s', expected '%s'", s.fb_dev.c_str(), hwutil::trim(name).c_str(), s.fb_name.c_str());
+      return -1;
+    }
+    int fd = ::open(s.fb_dev.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+      LOGW("leds: open %s: %s", s.fb_dev.c_str(), strerror(errno));
+      return -1;
+    }
+    ioctl(fd, FBIOGET_VSCREENINFO, &var);
+    return fd;
   }
 
   bool open_fb() {
-    if (!trigger_is("cucumber:red:ring0", "ledfb-ring") || !trigger_is("cucumber:red:logo0", "ledfb-logo")) {
-      LOGW("leds: ledfb triggers not active, using sysfs");
-      return false;
-    }
-    fb_ring = ::open("/dev/fb0", O_RDWR | O_CLOEXEC);
-    fb_logo = ::open("/dev/fb1", O_RDWR | O_CLOEXEC);
-    std::string n0, n1;
-    hwutil::read_file("/sys/class/graphics/fb0/name", n0);
-    hwutil::read_file("/sys/class/graphics/fb1/name", n1);
-    if (fb_ring < 0 || fb_logo < 0 || hwutil::trim(n0) != "ring" || hwutil::trim(n1) != "logo") {
-      LOGW("leds: framebuffers unavailable (fb0=%s fb1=%s)", hwutil::trim(n0).c_str(), hwutil::trim(n1).c_str());
-      if (fb_ring >= 0) close(fb_ring);
-      if (fb_logo >= 0) close(fb_logo);
-      fb_ring = fb_logo = -1;
-      return false;
-    }
-    ioctl(fb_ring, FBIOGET_VSCREENINFO, &var_ring);
-    ioctl(fb_logo, FBIOGET_VSCREENINFO, &var_logo);
-    return true;
+    fb_ring = open_strip_fb(model.ring, var_ring);
+    if (nlogo) fb_logo = open_strip_fb(model.logo, var_logo);
+    if (fb_ring >= 0 && (!nlogo || fb_logo >= 0)) return true;
+    if (fb_ring >= 0) close(fb_ring);
+    if (fb_logo >= 0) close(fb_logo);
+    fb_ring = fb_logo = -1;
+    return false;
   }
 
   bool open_sysfs() {
     static const char *cols[] = {"red", "green", "blue"};
-    for (int i = 0; i < kRing + kLogo; i++)
+    for (int i = 0; i < n + nlogo; i++)
       for (const char *c : cols) {
-        char path[128];
-        if (i < kRing)
-          snprintf(path, sizeof path, "%scucumber:%s:ring%d/brightness", kLedDir, c, i);
-        else
-          snprintf(path, sizeof path, "%scucumber:%s:logo%d/brightness", kLedDir, c, i - kRing);
-        int fd = ::open(path, O_WRONLY | O_CLOEXEC);
+        std::string path = kLedDir + (i < n ? led_name(model.ring, c, i) : led_name(model.logo, c, i - n)) +
+                           "/brightness";
+        int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
         if (fd < 0) {
-          LOGE("leds: cannot open %s", path);
+          LOGE("leds: cannot open %s", path.c_str());
           return false;
         }
         sysfs_fds.push_back(fd);
@@ -157,52 +165,43 @@ struct Leds::Impl {
     return true;
   }
 
+  // Writes count pixels of px (RGB) to a framebuffer as BGR and latches them.
+  void write_fb(int fd, fb_var_screeninfo &var, const uint8_t *px, int count, const char *what) {
+    std::vector<uint8_t> bgr(size_t(count) * 3);
+    for (int i = 0; i < count; i++) {
+      bgr[i * 3] = px[i * 3 + 2];
+      bgr[i * 3 + 1] = px[i * 3 + 1];
+      bgr[i * 3 + 2] = px[i * 3];
+    }
+    if (pwrite(fd, bgr.data(), bgr.size(), 0) != ssize_t(bgr.size())) LOGW("leds: %s write: %s", what, strerror(errno));
+    ioctl(fd, FBIOPAN_DISPLAY, &var);  // latch
+  }
+
   void output(const Col *ring, const Col *logo) {
-    uint8_t px[(kRing + kLogo) * 3];
-    for (int i = 0; i < kRing; i++) {
-      px[i * 3 + 0] = to8(ring[i].r);
-      px[i * 3 + 1] = to8(ring[i].g);
-      px[i * 3 + 2] = to8(ring[i].b);
+    std::vector<uint8_t> px(size_t(n + nlogo) * 3);
+    for (int i = 0; i < n + nlogo; i++) {
+      const Col &c = i < n ? ring[i] : logo[i - n];
+      px[i * 3 + 0] = to8(c.r);
+      px[i * 3 + 1] = to8(c.g);
+      px[i * 3 + 2] = to8(c.b);
     }
-    for (int i = 0; i < kLogo; i++) {
-      px[(kRing + i) * 3 + 0] = to8(logo[i].r);
-      px[(kRing + i) * 3 + 1] = to8(logo[i].g);
-      px[(kRing + i) * 3 + 2] = to8(logo[i].b);
-    }
+    const bool have_last = !last.empty();
     if (fb_ring >= 0) {
-      bool ring_changed = !have_last || memcmp(px, last, kRing * 3) != 0;
-      bool logo_changed = !have_last || memcmp(px + kRing * 3, last + kRing * 3, kLogo * 3) != 0;
-      uint8_t bgr[kRing * 3];
-      if (ring_changed) {
-        for (int i = 0; i < kRing; i++) {
-          bgr[i * 3] = px[i * 3 + 2];
-          bgr[i * 3 + 1] = px[i * 3 + 1];
-          bgr[i * 3 + 2] = px[i * 3];
-        }
-        if (pwrite(fb_ring, bgr, kRing * 3, 0) != kRing * 3) LOGW("leds: fb0 write: %s", strerror(errno));
-        ioctl(fb_ring, FBIOPAN_DISPLAY, &var_ring);  // latch
-      }
-      if (logo_changed) {
-        for (int i = 0; i < kLogo; i++) {
-          bgr[i * 3] = px[(kRing + i) * 3 + 2];
-          bgr[i * 3 + 1] = px[(kRing + i) * 3 + 1];
-          bgr[i * 3 + 2] = px[(kRing + i) * 3];
-        }
-        if (pwrite(fb_logo, bgr, kLogo * 3, 0) != kLogo * 3) LOGW("leds: fb1 write: %s", strerror(errno));
-        ioctl(fb_logo, FBIOPAN_DISPLAY, &var_logo);
-      }
+      if (!have_last || memcmp(px.data(), last.data(), size_t(n) * 3) != 0)
+        write_fb(fb_ring, var_ring, px.data(), n, "ring fb");
+      if (fb_logo >= 0 && (!have_last || memcmp(px.data() + n * 3, last.data() + n * 3, size_t(nlogo) * 3) != 0))
+        write_fb(fb_logo, var_logo, px.data() + n * 3, nlogo, "logo fb");
     } else {
       for (size_t k = 0; k < sysfs_fds.size(); k++)
         if (!have_last || px[k] != last[k]) hwutil::write_int_fd(sysfs_fds[k], px[k]);
     }
-    memcpy(last, px, sizeof px);
-    have_last = true;
+    last = std::move(px);
   }
 
   // Renders the current frame; returns true if the content is animated (needs further frames).
   bool render(int64_t now, Col *ring) {
     int64_t t = now - state_t0;
-    for (int i = 0; i < kRing; i++) ring[i] = {};
+    for (int i = 0; i < n; i++) ring[i] = {};
     bool animated = true;
     switch (state) {
       case UiState::IDLE:
@@ -210,28 +209,29 @@ struct Leds::Impl {
         break;
       case UiState::WAKE: {
         // Sweep from ring0 outward in both directions in 250 ms, then hold bright ice-blue.
-        float reach = std::min(1.f, float(t) / 250.f) * (kRing / 2 + 1);
-        for (int i = 0; i <= kRing / 2; i++) {
+        float reach = std::min(1.f, float(t) / 250.f) * (n / 2 + 1);
+        for (int i = 0; i <= n / 2; i++) {
           float k = std::max(0.f, std::min(1.f, reach - i));
           ring[i] = kWake * k;
-          ring[(kRing - i) % kRing] = ring[i];
+          ring[(n - i) % n] = ring[i];
         }
         animated = t < 300;
         break;
       }
       case UiState::LISTENING: {
         float k = 0.55f + 0.45f * wave(t, 2000);
-        for (int i = 0; i < kRing; i++) ring[i] = kCyan * k;
+        for (int i = 0; i < n; i++) ring[i] = kCyan * k;
         break;
       }
       case UiState::THINKING: {
         // Two comets rotating (one turn per 1.2 s).
-        float head = float(t % 1200) / 1200.f * kRing;
-        for (int i = 0; i < kRing; i++) {
+        const float len = std::max(1.5f, kCometLen24 * n / 24.f);
+        float head = float(t % 1200) / 1200.f * n;
+        for (int i = 0; i < n; i++) {
           for (int c = 0; c < 2; c++) {
-            float d = std::fmod(head + c * (kRing / 2) - i + kRing * 2, float(kRing));  // distance behind head
-            if (d < 7) {
-              Col v = kBlue * (1.f - d / 7.f);
+            float d = std::fmod(head + c * (n / 2.f) - i + n * 2, float(n));  // distance behind head
+            if (d < len) {
+              Col v = kBlue * (1.f - d / len);
               ring[i] = {std::max(ring[i].r, v.r), std::max(ring[i].g, v.g), std::max(ring[i].b, v.b)};
             }
           }
@@ -242,7 +242,7 @@ struct Leds::Impl {
       }
       case UiState::SPEAKING: {
         float k = 0.45f + 0.55f * wave(t, 700);
-        for (int i = 0; i < kRing; i++) ring[i] = kBlue * k;
+        for (int i = 0; i < n; i++) ring[i] = kBlue * k;
         break;
       }
       case UiState::ERROR: {
@@ -252,24 +252,24 @@ struct Leds::Impl {
           return render(now, ring);
         }
         float k = (t % 400) < 200 ? 0.9f : 0.f;
-        for (int i = 0; i < kRing; i++) ring[i] = kRed * k;
+        for (int i = 0; i < n; i++) ring[i] = kRed * k;
         break;
       }
       case UiState::MUTED:
-        for (int i = 0; i < kRing; i++) ring[i] = kRed * 0.25f;
+        for (int i = 0; i < n; i++) ring[i] = kRed * 0.25f;
         animated = false;
         break;
       case UiState::TIMER_RING: {
         float k = 0.15f + 0.85f * wave(t, 1000);
-        for (int i = 0; i < kRing; i++) ring[i] = kOrange * k;
+        for (int i = 0; i < n; i++) ring[i] = kOrange * k;
         break;
       }
     }
     if (now < volume_until) {
-      // Volume arc overlay: v*24 LEDs from ring0, partial last LED, remaining ring dark.
-      float n = volume * kRing;
-      for (int i = 0; i < kRing; i++) {
-        float k = std::max(0.f, std::min(1.f, n - i));
+      // Volume arc overlay: v*n LEDs from LED 0, partial last LED, remaining ring dark.
+      float lit = volume * n;
+      for (int i = 0; i < n; i++) {
+        float k = std::max(0.f, std::min(1.f, lit - i));
         ring[i] = kWhite * (0.15f + 0.65f * k) * (k > 0 ? 1.f : 0.f);
       }
       animated = true;  // need a frame when the overlay expires
@@ -282,15 +282,15 @@ struct Leds::Impl {
     Col base = user_col * user_bri;
     if (effect == "Rainbow") {
       float off = float(now % 6000) / 6000.f;
-      for (int i = 0; i < kRing; i++) ring[i] = hsv(off + float(i) / kRing, 1.f, user_bri);
+      for (int i = 0; i < n; i++) ring[i] = hsv(off + float(i) / n, 1.f, user_bri);
       return true;
     }
     if (effect == "Breathe") {
       float k = 0.1f + 0.9f * wave(now, 4000);
-      for (int i = 0; i < kRing; i++) ring[i] = base * k;
+      for (int i = 0; i < n; i++) ring[i] = base * k;
       return true;
     }
-    for (int i = 0; i < kRing; i++) ring[i] = base;
+    for (int i = 0; i < n; i++) ring[i] = base;
     return false;
   }
 
@@ -301,14 +301,13 @@ struct Leds::Impl {
 
   void frame() {
     int64_t now = Loop::now_ms();
-    Col ring[kRing];
-    bool animated = render(now, ring);
+    std::vector<Col> ring(static_cast<size_t>(n));
+    bool animated = render(now, ring.data());
     // Logo mirrors the ring's average colour.
     Col avg;
-    for (auto &c : ring) avg = {avg.r + c.r / kRing, avg.g + c.g / kRing, avg.b + c.b / kRing};
-    Col logo[kLogo];
-    for (auto &c : logo) c = avg;
-    output(ring, logo);
+    for (auto &c : ring) avg = {avg.r + c.r / n, avg.g + c.g / n, avg.b + c.b / n};
+    std::vector<Col> logo(size_t(nlogo), avg);
+    output(ring.data(), logo.data());
     if (animated && !timer) {
       timer = loop.add_timer(kFrameMs, [this] { frame(); }, kFrameMs);
     } else if (!animated && timer) {
@@ -318,15 +317,15 @@ struct Leds::Impl {
   }
 };
 
-Leds::Leds(Loop &loop) : impl_(new Impl(loop)) {}
+Leds::Leds(Loop &loop, const Model &model) : impl_(new Impl(loop, model)) {}
 Leds::~Leds() = default;
 
 bool Leds::open() {
   auto &d = *impl_;
   if (d.open_fb()) {
-    LOGI("leds: driving ring/logo via /dev/fb0,/dev/fb1");
+    LOGI("leds: driving %d ring + %d logo LEDs via framebuffer", d.n, d.nlogo);
   } else if (d.open_sysfs()) {
-    LOGI("leds: driving ring/logo via sysfs brightness");
+    LOGI("leds: driving %d ring + %d logo LEDs via sysfs brightness", d.n, d.nlogo);
   } else {
     return false;
   }

@@ -251,7 +251,7 @@ struct ApiServer::Impl {
         std::string("version=") + kEsphomeVersion,
         "mac=" + mac_plain,
         "platform=host",
-        "board=cucumber",
+        "board=" + id.board,
         "network=wifi",
         std::string("project_name=") + kProjectName,
         "project_version=" + id.project_version,

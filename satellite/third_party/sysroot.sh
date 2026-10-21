@@ -1,12 +1,15 @@
 #!/bin/sh
 # One-time build of the link-time sysroot: alsa-lib headers + libasound.so for one target.
 # Only used for linking; at runtime the daemon uses the firmware's own /usr/lib/libasound.so.2.
-# The binaries only import ALSA_0.9* symbol versions, which every alsa-lib 1.x provides.
-# Usage: third_party/sysroot.sh <sysroot dir> "<zig target> [cpu flags]" <autoconf host>
+# Symbol versions must match the firmware's library: the Midi's alsa-lib is versioned (the
+# binaries import ALSA_0.9* only, which every alsa-lib 1.x provides), the Lite 2's 1.2.1.2 is
+# built without versions (pass --with-versioned=no).
+# Usage: third_party/sysroot.sh <sysroot dir> "<zig target> [cpu flags]" <autoconf host> [configure flags]
 set -eu
 OUT=$(realpath -m "$1")
 TARGET=$2
 HOST=$3
+EXTRA=${4:-}
 ZIG=${ZIG:-zig}
 VER=1.2.10
 SHA256=c86a45a846331b1b0aa6e6be100be2a7aef92efd405cf6bac7eef8174baa920e
@@ -32,11 +35,20 @@ tar -xjf "$TARBALL" -C "$WORK"
 cd "$WORK/alsa-lib-$VER"
 # Symbol versions are kept (ALSA_0.9 … like the firmware's build); lld rejects alsa-lib's version
 # script entries for features that are not compiled in unless --undefined-version is given.
-CC="$ZIG cc -target $TARGET" AR="$ZIG ar" RANLIB="$ZIG ranlib" LDFLAGS="-Wl,--undefined-version" \
-  ./configure --host="$HOST" --prefix=/ --disable-python >configure.log 2>&1 \
+LDFLAGS="-Wl,--undefined-version"
+CC="$ZIG cc -target $TARGET" AR="$ZIG ar" RANLIB="$ZIG ranlib" LDFLAGS="$LDFLAGS" \
+  ./configure --host="$HOST" --prefix=/ --disable-python $EXTRA >configure.log 2>&1 \
   || { tail -20 configure.log; exit 1; }
+case " $EXTRA " in
+  *" --with-versioned=no "*)
+    # Without alsa's version script the library would also export zig's compiler-rt helpers
+    # (__aeabi_uldivmod, ...); the daemon would then import them from libasound, which the
+    # firmware's copy does not provide. Export only the ALSA API, unversioned.
+    printf '{ global: snd_*; _snd_*; local: *; };\n' >exports.map
+    LDFLAGS="$LDFLAGS -Wl,--version-script=$PWD/exports.map" ;;
+esac
 make -j"$(nproc)" -C include >/dev/null
-make -j"$(nproc)" -C src >build.log 2>&1 || { tail -20 build.log; exit 1; }
+make -j"$(nproc)" -C src LDFLAGS="$LDFLAGS" >build.log 2>&1 || { tail -20 build.log; exit 1; }
 
 rm -rf "$OUT"
 mkdir -p "$OUT/lib"

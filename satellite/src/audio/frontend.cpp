@@ -3,7 +3,9 @@
 #include <alsa/asoundlib.h>
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 
 #include "core/log.h"
@@ -12,8 +14,9 @@
 //   VQE functions return a YandexVqeC_Error* (nullptr on success).
 //   Spotter functions take a trailing spotter_error** (set on failure).
 //   VQE I/O is float in [-1, 1]; mics/speakers are frame-interleaved; Process consumes
-//   GetInputChunkSize() frames (3072 @ 96 kHz) and yields GetProcessingFrame() samples (512 @ 16 kHz)
-//   per output channel. Output channel types follow voicetech.AudioInputChannelType.
+//   GetInputChunkSize() frames (Midi: 3072 @ 96 kHz, Lite 2: 1536 @ 48 kHz) and yields
+//   GetProcessingFrame() samples (512 @ 16 kHz) per output channel. Output channel types follow
+//   voicetech.AudioInputChannelType.
 //   Spotter input is s16le interleaved in the channel order passed to spotter_create_multichannel.
 
 namespace cs {
@@ -21,9 +24,6 @@ namespace {
 
 constexpr const char *kLibDir = "/system/vendor/quasar/libs/";
 constexpr const char *kVqeModels = "/system/vendor/quasar/vqe_models";
-constexpr const char *kVqePreset = "cucumber";
-constexpr const char *kPcm = "hw:0,2";
-constexpr unsigned kRate = 96000, kChannels = 8, kMics = 4, kSpk = 4;
 
 // voicetech.AudioInputChannelType (VQE output channel types)
 enum : int { RAW_MAIN_MIC_SYNC = 2, VQE_OMNI = 6, VQE_OMNI_WITH_GAIN = 9 };
@@ -122,12 +122,12 @@ struct AudioFrontend::Engine {
     return false;
   }
 
-  bool init_vqe() {
-    if (!vqe_check(cfg_create(kVqePreset, &cfg), "VQE config")) return false;
+  bool init_vqe(const std::string &preset) {
+    if (!vqe_check(cfg_create(preset.c_str(), &cfg), "VQE config")) return false;
     chunk = cfg_chunk(cfg);
     frame = cfg_frame(cfg);
     if (!vqe_check(vqe_create(cfg, kVqeModels, 0, nullptr, &vqe), "VQE create")) return false;
-    LOGI("VQE '%s': %d input frames -> %d output samples per chunk", kVqePreset, chunk, frame);
+    LOGI("VQE '%s': %d input frames -> %d output samples per chunk", preset.c_str(), chunk, frame);
     return true;
   }
 
@@ -216,13 +216,14 @@ struct AudioFrontend::Engine {
   }
 };
 
-AudioFrontend::AudioFrontend(Loop &loop) : loop_(loop) {}
+AudioFrontend::AudioFrontend(Loop &loop, const Model &model) : loop_(loop), model_(model) {}
 
 AudioFrontend::~AudioFrontend() { stop(); }
 
 bool AudioFrontend::start(const std::string &model_dir, const std::string &command_model_dir) {
   eng_ = std::make_unique<Engine>();
-  if (!eng_->load() || !eng_->init_vqe() || !eng_->init_spotter(eng_->wake, model_dir, VQE_OMNI_WITH_GAIN)) {
+  if (!eng_->load() || !eng_->init_vqe(model_.vqe_preset) ||
+      !eng_->init_spotter(eng_->wake, model_dir, VQE_OMNI_WITH_GAIN)) {
     eng_.reset();
     return false;
   }
@@ -244,46 +245,84 @@ void AudioFrontend::set_model(const std::string &model_dir) {
   pending_model_ = model_dir;
 }
 
+// Two threads: a capture thread that only drains ALSA into a FIFO, and this processing thread
+// (VQE + spotters). The Lite 2's PDM capture allows at most ~42 ms of buffer (2048 frames at
+// 8 ch S16); VQE chunks occasionally take longer than the remaining slack, which overran the
+// device buffer when reading and processing shared one thread.
 void AudioFrontend::run() {
   Engine &e = *eng_;
-  snd_pcm_t *pcm = nullptr;
-  const snd_pcm_uframes_t period = e.chunk;
-  auto open_pcm = [&]() -> bool {
-    int err = snd_pcm_open(&pcm, kPcm, SND_PCM_STREAM_CAPTURE, 0);
-    if (err < 0) {
-      LOGE("snd_pcm_open %s: %s", kPcm, snd_strerror(err));
-      return false;
-    }
-    snd_pcm_hw_params_t *hw;
-    snd_pcm_hw_params_alloca(&hw);
-    snd_pcm_hw_params_any(pcm, hw);
-    snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
-    snd_pcm_hw_params_set_channels(pcm, hw, kChannels);
-    unsigned rate = kRate;
-    snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, nullptr);
-    snd_pcm_uframes_t per = period, buf = period * 8;
-    snd_pcm_hw_params_set_period_size_near(pcm, hw, &per, nullptr);
-    snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buf);
-    if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
-      LOGE("snd_pcm_hw_params: %s", snd_strerror(err));
-      snd_pcm_close(pcm);
-      pcm = nullptr;
-      return false;
-    }
-    LOGI("capture %s: %u Hz, %u ch, period %lu, buffer %lu", kPcm, rate, kChannels, (unsigned long)per,
-         (unsigned long)buf);
-    return true;
-  };
+  const size_t period = size_t(e.chunk);
+  const char *dev = model_.capture_pcm.c_str();
+  const unsigned nch = model_.capture_channels;
+  const auto &mic_ch = model_.mic_channels, &spk_ch = model_.spk_channels;
+  const size_t nmic = mic_ch.size(), nspk = spk_ch.size();
+  const size_t fifo_max = size_t(model_.capture_rate) * nch;  // 1 s of audio
 
-  std::vector<int16_t> in(period * kChannels);
-  std::vector<float> mics(period * kMics), spk(period * kSpk);
+  std::mutex fifo_mu;
+  std::condition_variable fifo_cv;
+  std::vector<int16_t> fifo;  // interleaved frames, oldest first
+
+  std::thread reader([&] {
+    snd_pcm_t *pcm = nullptr;
+    snd_pcm_uframes_t hw_period = period;
+    auto open_pcm = [&]() -> bool {
+      int err = snd_pcm_open(&pcm, dev, SND_PCM_STREAM_CAPTURE, 0);
+      if (err < 0) {
+        LOGE("snd_pcm_open %s: %s", dev, snd_strerror(err));
+        return false;
+      }
+      snd_pcm_hw_params_t *hw;
+      snd_pcm_hw_params_alloca(&hw);
+      snd_pcm_hw_params_any(pcm, hw);
+      snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+      snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
+      snd_pcm_hw_params_set_channels(pcm, hw, nch);
+      unsigned rate = model_.capture_rate;
+      snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, nullptr);
+      snd_pcm_uframes_t per = period, buf = period * 8;
+      snd_pcm_hw_params_set_period_size_near(pcm, hw, &per, nullptr);
+      snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buf);
+      if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
+        LOGE("snd_pcm_hw_params: %s", snd_strerror(err));
+        snd_pcm_close(pcm);
+        pcm = nullptr;
+        return false;
+      }
+      LOGI("capture %s: %u Hz, %u ch, period %lu, buffer %lu", dev, rate, nch, (unsigned long)per,
+           (unsigned long)buf);
+      hw_period = std::min<snd_pcm_uframes_t>(per, period);
+      return true;
+    };
+    std::vector<int16_t> in(period * nch);
+    while (running_) {
+      if (!pcm && !open_pcm()) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        continue;
+      }
+      snd_pcm_sframes_t n = snd_pcm_readi(pcm, in.data(), hw_period);
+      if (n < 0) {
+        LOGW("capture: %s, recovering", snd_strerror((int)n));
+        if (snd_pcm_recover(pcm, (int)n, 1) < 0) {
+          snd_pcm_close(pcm);
+          pcm = nullptr;
+        }
+        continue;
+      }
+      std::lock_guard<std::mutex> lk(fifo_mu);
+      fifo.insert(fifo.end(), in.begin(), in.begin() + n * nch);
+      if (fifo.size() > fifo_max) {
+        LOGW("capture: processing behind, dropping %zu frames", (fifo.size() - fifo_max) / nch);
+        fifo.erase(fifo.begin(), fifo.end() - fifo_max);
+      }
+      fifo_cv.notify_one();
+    }
+    if (pcm) snd_pcm_close(pcm);
+  });
+
+  std::vector<int16_t> in(period * nch);
+  std::vector<float> mics(period * nmic), spk(period * nspk);
 
   while (running_) {
-    if (!pcm && !open_pcm()) {
-      std::this_thread::sleep_for(std::chrono::seconds(2));
-      continue;
-    }
     {
       std::lock_guard<std::mutex> lk(model_mu_);
       if (!pending_model_.empty()) {
@@ -292,27 +331,19 @@ void AudioFrontend::run() {
         pending_model_.clear();
       }
     }
-    // Read exactly one VQE chunk.
-    size_t got = 0;
-    while (got < period && running_) {
-      snd_pcm_sframes_t n = snd_pcm_readi(pcm, in.data() + got * kChannels, period - got);
-      if (n < 0) {
-        LOGW("capture: %s, recovering", snd_strerror((int)n));
-        if (snd_pcm_recover(pcm, (int)n, 1) < 0) {
-          snd_pcm_close(pcm);
-          pcm = nullptr;
-          break;
-        }
+    // Take exactly one VQE chunk.
+    {
+      std::unique_lock<std::mutex> lk(fifo_mu);
+      if (!fifo_cv.wait_for(lk, std::chrono::milliseconds(500), [&] { return fifo.size() >= in.size(); }))
         continue;
-      }
-      got += n;
+      std::copy(fifo.begin(), fifo.begin() + in.size(), in.begin());
+      fifo.erase(fifo.begin(), fifo.begin() + in.size());
     }
-    if (got < period) continue;
 
     for (size_t i = 0; i < period; i++) {
-      const int16_t *f = &in[i * kChannels];
-      for (unsigned c = 0; c < kMics; c++) mics[i * kMics + c] = f[c] * (1.0f / 32768.f);
-      for (unsigned c = 0; c < kSpk; c++) spk[i * kSpk + c] = f[kMics + c] * (1.0f / 32768.f);
+      const int16_t *f = &in[i * nch];
+      for (size_t c = 0; c < nmic; c++) mics[i * nmic + c] = f[mic_ch[c]] * (1.0f / 32768.f);
+      for (size_t c = 0; c < nspk; c++) spk[i * nspk + c] = f[spk_ch[c]] * (1.0f / 32768.f);
     }
     if (!e.vqe_check(e.vqe_process(e.vqe, mics.data(), mics.size(), spk.data(), spk.size()), "VQE process")) continue;
 
@@ -344,7 +375,7 @@ void AudioFrontend::run() {
         });
     }
   }
-  if (pcm) snd_pcm_close(pcm);
+  reader.join();
 }
 
 }  // namespace cs

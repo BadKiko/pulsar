@@ -1,10 +1,12 @@
-// Buttons of the Station Midi via evdev (devices matched by name in /proc/bus/input/devices).
+// Buttons via evdev (devices matched by name in /proc/bus/input/devices, names per Model).
+// Station Midi: touch keys "awinic_sar", mute switch "mute"; Station Lite 2: touch keys "aw9610x",
+// mute switch "gpio-keys". Both use the same key codes and switch:
 //
-// "awinic_sar" (capacitive touch keys, EV_KEY only; KEY bitmap "40 0 0 0 0 0 0 0 c000000000000 0"):
+// touch keys (capacitive, EV_KEY only; Midi KEY bitmap "40 0 0 0 0 0 0 0 c000000000000 0"):
 //   KEY_VOICECOMMAND (582) -> ACTION   (maind: "ACTIVATE")
 //   KEY_VOLUMEUP     (115) -> VOLUME_UP
 //   KEY_VOLUMEDOWN   (114) -> VOLUME_DOWN
-// "mute" (gpio-keys, KEY bitmap bit 113 KEY_MUTE, SW bitmap 0x4000 = SW_MUTE_DEVICE (14)):
+// mute switch (gpio-keys, KEY bitmap bit 113 KEY_MUTE, SW bitmap 0x4000 = SW_MUTE_DEVICE (14)):
 //   the hardware microphone mute slider/toggle; SW_MUTE_DEVICE=1 means muted. Its KEY_MUTE
 //   press/release events are ignored, the switch state is authoritative (initial value via
 //   EVIOCGSW).
@@ -158,10 +160,10 @@ struct Input::Impl {
     }
   }
 
-  int open_dev(const char *name) {
+  int open_dev(const std::string &name) {
     std::string path = find_event_dev(name);
     if (path.empty()) {
-      LOGE("input: device \"%s\" not found", name);
+      LOGE("input: device \"%s\" not found", name.c_str());
       return -1;
     }
     int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -169,19 +171,19 @@ struct Input::Impl {
       LOGE("input: open %s: %s", path.c_str(), strerror(errno));
       return -1;
     }
-    LOGI("input: \"%s\" -> %s", name, path.c_str());
+    LOGI("input: \"%s\" -> %s", name.c_str(), path.c_str());
     loop.add_fd(fd, EPOLLIN, [this, fd](uint32_t) { drain(fd); });
     return fd;
   }
 };
 
-Input::Input(Loop &loop) : impl_(new Impl(loop)) {}
+Input::Input(Loop &loop, const Model &model) : impl_(new Impl(loop)), model_(model) {}
 Input::~Input() = default;
 
 bool Input::open() {
   auto &d = *impl_;
-  d.keys_fd = d.open_dev("awinic_sar");
-  d.mute_fd = d.open_dev("mute");
+  d.keys_fd = d.open_dev(model_.keys_input);
+  d.mute_fd = d.open_dev(model_.mute_input);
   if (d.mute_fd >= 0) {
     unsigned long sw[(SW_MAX + 1 + 8 * sizeof(long) - 1) / (8 * sizeof(long))] = {};
     if (ioctl(d.mute_fd, EVIOCGSW(sizeof sw), sw) >= 0) {

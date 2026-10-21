@@ -1,5 +1,5 @@
-// Hardware of the Yandex Station Midi (cucumber): LED ring, logo, 7-segment clock,
-// touch/mute buttons, ambient light sensor. All via sysfs / evdev; no Yandex code.
+// Hardware UI of the supported Yandex Stations (layout per Model): LED ring (+ logo), 7-segment
+// clock, touch/mute buttons, ambient light sensor. All via sysfs / evdev; no Yandex code.
 #pragma once
 
 #include <array>
@@ -9,6 +9,7 @@
 #include <string>
 
 #include "core/loop.h"
+#include "model.h"
 
 namespace cs {
 
@@ -30,9 +31,9 @@ enum class UiState {
 
 class Leds {
  public:
-  explicit Leds(Loop &loop);
+  Leds(Loop &loop, const Model &model);
   ~Leds();
-  bool open();  // /sys/class/leds/cucumber:{red,green,blue}:{ring0..23,logo0..5}
+  bool open();  // framebuffers / sysfs LEDs of Model::ring and Model::logo
   void set_ui_state(UiState s);
   // User light (HA light entity) shown on the ring when UiState is IDLE.
   void set_user_light(bool on, Rgb color, float brightness, const std::string &effect);
@@ -46,9 +47,9 @@ class Leds {
 
 class Clock {
  public:
-  explicit Clock(Loop &loop);
+  Clock(Loop &loop, const Model &model);
   ~Clock();
-  bool open();  // /sys/class/leds/cucumber:white:clock-*
+  bool open();  // sysfs LEDs <Model::clock_dir><segment><position>
   void set_enabled(bool on);
   void set_brightness(float b);  // 0..1 user scale (multiplied by ambient auto-dimming)
   void set_ambient_lux(float lux);
@@ -73,9 +74,9 @@ class Input {
  public:
   using ButtonCb = std::function<void(Button, Press)>;
   using MuteCb = std::function<void(bool hw_muted)>;
-  explicit Input(Loop &loop);
+  Input(Loop &loop, const Model &model);
   ~Input();
-  bool open();  // evdev: "awinic_sar" (touch keys), "mute" (gpio switch)
+  bool open();  // evdev: Model::keys_input (touch keys), Model::mute_input (mic mute switch)
   bool hw_muted() const;
   void on_button(ButtonCb cb);
   void on_mute(MuteCb cb);
@@ -83,6 +84,7 @@ class Input {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  const Model &model_;
 };
 
 class LightSensor {

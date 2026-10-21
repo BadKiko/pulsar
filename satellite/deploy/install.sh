@@ -24,10 +24,11 @@ RK=/data/quasar/rootkeeper.sh
 HOOK_SAT='[ -x /data/cucumber-satellite/boot.sh ] && /data/cucumber-satellite/boot.sh </dev/null >/dev/null 2>&1 &'
 HOOK_SSH='[ -x /data/dropbear/start.sh ] && /data/dropbear/start.sh </dev/null >/dev/null 2>&1 &'
 
-# Devicetree codename -> name. Only models listed in SUPPORTED get installed: the daemon drives
-# model-specific hardware (mic array + VQE preset, LED framebuffers, clock, inputs).
+# Devicetree codename -> name / userland ABI (build/<arch>/). Only models listed in ARCH_OF get
+# installed: the daemon drives model-specific hardware (mic array + VQE preset, LEDs, clock, inputs).
 declare -A MODEL_NAME=([cucumber]="Yandex Station Midi" [plum]="Yandex Station Lite 2")
-SUPPORTED=" cucumber "
+declare -A ARCH_OF=([cucumber]=aarch64 [plum]=armhf)
+declare -A ARCH_FOR=()  # serial -> arch of the probed station
 
 SSH=0 ENABLE=1 YES=0 LIST=0 SCAN=0
 TARGETS=()
@@ -60,7 +61,7 @@ echo __rc=\$?" 2>/dev/null | tr -d '\r') || return 1
 build() {
   echo "== build"
   make -C "$SAT" -j"$(nproc)" >/dev/null
-  if [ $SSH = 1 ] && ! { [ -s "$ROOT/ssh/out/dropbearmulti" ] && [ -s "$ROOT/ssh/out/sftp-server" ]; }; then
+  if [ $SSH = 1 ] && { ! [ -s "$ROOT/ssh/out/aarch64/dropbearmulti" ] || ! [ -s "$ROOT/ssh/out/armhf/dropbearmulti" ]; }; then
     "$ROOT/ssh/build.sh" >/dev/null
   fi
 }
@@ -110,7 +111,7 @@ probe() { # serial connected_by_us
     return 0
   fi
   name="${MODEL_NAME[$code]:-unknown Yandex device} ($code)"
-  if [[ $SUPPORTED != *" $code "* ]]; then
+  if [ -z "${ARCH_OF[$code]:-}" ]; then
     echo "  $s: $name — not supported yet, skipped"
     [ "$ours" = 1 ] && adb disconnect "$s" >/dev/null 2>&1
     return 0
@@ -129,17 +130,19 @@ probe() { # serial connected_by_us
   elif sh_ "$s" "[ -x $D/cucumber-satellite ]"; then state="satellite installed, not running"
   else state="stock Yandex"; fi
   FOUND+=("$s")
+  ARCH_FOR[$s]=${ARCH_OF[$code]}
   echo "  [${#FOUND[@]}] $s: $name — $state"
 }
 
 # errexit does not apply inside a function called from `||`: every step checks its own status.
 install_one() { # serial
   local s=$1 want got hooks tmp f
-  echo "== $s: daemon"
+  local bin=$SAT/build/${ARCH_FOR[$s]}/cucumber-satellite ssh_out=$ROOT/ssh/out/${ARCH_FOR[$s]}
+  echo "== $s: daemon (${ARCH_FOR[$s]})"
   sh_ "$s" "mkdir -p $D" || return 1
-  adb -s "$s" push "$SAT/build/cucumber-satellite" "$D/cucumber-satellite.new" >/dev/null || return 1
+  adb -s "$s" push "$bin" "$D/cucumber-satellite.new" >/dev/null || return 1
   for f in boot.sh supervise.sh ctl.sh; do adb -s "$s" push "$SAT/deploy/$f" "$D/$f" >/dev/null || return 1; done
-  want=$(sha256sum "$SAT/build/cucumber-satellite" | cut -d' ' -f1)
+  want=$(sha256sum "$bin" | cut -d' ' -f1)
   got=$(sh_ "$s" "sha256sum $D/cucumber-satellite.new" | cut -d' ' -f1)
   if [ "$want" != "$got" ]; then
     sh_ "$s" "rm -f $D/cucumber-satellite.new" || true
@@ -153,12 +156,12 @@ install_one() { # serial
   if [ $SSH = 1 ]; then
     echo "== $s: dropbear"
     sh_ "$s" "mkdir -p /data/dropbear" || return 1
-    adb -s "$s" push "$ROOT/ssh/out/dropbearmulti" /data/dropbear/dropbearmulti.new >/dev/null || return 1
-    adb -s "$s" push "$ROOT/ssh/out/sftp-server" /data/dropbear/sftp-server >/dev/null || return 1
+    adb -s "$s" push "$ssh_out/dropbearmulti" /data/dropbear/dropbearmulti.new >/dev/null || return 1
+    adb -s "$s" push "$ssh_out/sftp-server" /data/dropbear/sftp-server.new >/dev/null || return 1
     adb -s "$s" push "$ROOT/ssh/start.sh" /data/dropbear/start.sh >/dev/null || return 1
-    # A running dropbear keeps the old binary busy; mv replaces it atomically.
-    sh_ "$s" "cd /data/dropbear && chmod 755 dropbearmulti.new sftp-server start.sh &&
-       mv dropbearmulti.new dropbearmulti && sync" || return 1
+    # Running binaries stay busy; mv replaces them atomically.
+    sh_ "$s" "cd /data/dropbear && chmod 755 dropbearmulti.new sftp-server.new start.sh &&
+       mv dropbearmulti.new dropbearmulti && mv sftp-server.new sftp-server && sync" || return 1
   fi
 
   echo "== $s: boot hooks"
