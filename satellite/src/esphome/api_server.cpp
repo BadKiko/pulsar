@@ -107,8 +107,9 @@ constexpr uint32_t NUMBER_MODE_SLIDER = 2;
 constexpr uint32_t FORMAT_PURPOSE_DEFAULT = 0, FORMAT_PURPOSE_ANNOUNCEMENT = 1;
 
 constexpr size_t kMaxFrame = 1 << 20;            // reject absurd frames
-constexpr size_t kAudioBacklogLimit = 256 << 10;  // drop mic audio when the socket is this far behind
+constexpr size_t kAudioBacklogLimit = 256 << 10;  // end the voice run when the socket is this far behind
 constexpr size_t kMaxBacklog = 8 << 20;           // give up on a client that stopped reading
+constexpr size_t kReadPerWakeup = 64 << 10;
 constexpr int64_t kHelloTimeoutMs = 15000;
 constexpr int64_t kIdlePingMs = 45000;
 constexpr int64_t kIdleDropMs = 100000;
@@ -190,7 +191,7 @@ struct ApiServer::Impl {
   std::shared_ptr<Client> pending;
   std::unique_ptr<MdnsResponder> mdns;
   uint64_t tick_timer = 0;
-  bool audio_drop_logged = false;
+  bool audio_overflowed = false;  // mic audio stopped for this run (backlog)
 
   // Cached entity state (replayed on SubscribeStatesRequest).
   MediaState media_state = MediaState::IDLE;
@@ -352,14 +353,18 @@ struct ApiServer::Impl {
 
   void on_readable(const std::shared_ptr<Client> &c) { process(c, read_into(c)); }
 
-  // Reads everything available into c->rbuf; returns true on EOF/error.
+  // Reads up to kReadPerWakeup bytes into c->rbuf; returns true on EOF/error. epoll is
+  // level-triggered, so the rest is read on the next wakeup and a flooding peer cannot starve
+  // the loop (capture hand-off, timers) or grow rbuf without bound before it is parsed.
   bool read_into(const std::shared_ptr<Client> &c) {
     char buf[16384];
     bool eof = false;
-    for (;;) {
+    size_t got = 0;
+    while (got < kReadPerWakeup) {
       ssize_t n = recv(c->fd, buf, sizeof buf, 0);
       if (n > 0) {
         c->rbuf.append(buf, size_t(n));
+        got += size_t(n);
         continue;
       }
       if (n == 0) {
@@ -372,7 +377,7 @@ struct ApiServer::Impl {
       }
       break;
     }
-    if (!c->rbuf.empty()) {
+    if (got) {
       c->last_rx = Loop::now_ms();
       c->ping_outstanding = false;
     }
@@ -990,7 +995,7 @@ void ApiServer::voice_request_start(const std::string &wake_word_phrase) {
   w.u32(3, 0);           // flags: wake word handled on-device, VAD in HA
   w.msg(4, audio);
   w.str(5, wake_word_phrase);
-  impl_->audio_drop_logged = false;
+  impl_->audio_overflowed = false;
   impl_->send_msg(VA_REQUEST, w);
 }
 
@@ -1002,10 +1007,13 @@ void ApiServer::voice_request_stop() {
 }
 
 void ApiServer::voice_send_audio(const int16_t *pcm, size_t samples) {
-  if (!voice_subscribed() || !samples) return;
+  if (!voice_subscribed() || !samples || impl_->audio_overflowed) return;
+  // A hole in the utterance would make HA transcribe garbage: end the run instead.
   if (impl_->backlog() > kAudioBacklogLimit) {
-    if (!impl_->audio_drop_logged) LOGW("api: network backlog, dropping mic audio");
-    impl_->audio_drop_logged = true;
+    LOGW("api: network backlog, ending the voice pipeline");
+    impl_->audio_overflowed = true;
+    voice_request_stop();
+    impl_->hooks.on_voice_audio_overflow();
     return;
   }
   pb::Writer w;
