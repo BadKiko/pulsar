@@ -4,6 +4,8 @@
 # cucumber-satellite under a restart loop. adbd and dropbear are never touched.
 D=/data/cucumber-satellite
 [ -f "$D/enabled" ] || exit 0
+# Never stop the Yandex stack when there is nothing to replace it with.
+[ -x "$D/cucumber-satellite" ] && [ -x "$D/supervise.sh" ] || exit 0
 pidof cucumber-satellite >/dev/null 2>&1 && exit 0
 
 # onboot.sh launches quasar right before calling us; wait for it, then stop it.
