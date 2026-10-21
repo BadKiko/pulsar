@@ -34,6 +34,10 @@ constexpr int kKeyAction = 582;  // KEY_VOICECOMMAND
 constexpr int64_t kLongPressMs = 800;
 constexpr int64_t kRepeatDelayMs = 500;
 constexpr int64_t kRepeatMs = 200;
+// maind's buttonsClickLimiter for "activate" (quasar.cfg): touches shorter than 56 ms and clicks
+// closer than 300 ms to the previous one are dropped.
+constexpr int64_t kMinActionPressMs = 56;
+constexpr int64_t kMinActionGapMs = 300;
 
 // Finds /dev/input/eventN for the device with the given name.
 std::string find_event_dev(const std::string &name) {
@@ -72,6 +76,7 @@ struct Input::Impl {
   MuteCb mute_cb;
 
   int64_t action_down = 0;  // 0 = not pressed
+  int64_t last_action_ms = 0;
   bool action_long_sent = false;
   uint64_t action_timer = 0;
   uint64_t repeat_timer = 0;
@@ -88,7 +93,8 @@ struct Input::Impl {
   }
 
   void emit(Button b, Press p) {
-    LOGD("input: button %d press %d", int(b), int(p));
+    LOGI("input: %s %s", b == Button::ACTION ? "action" : b == Button::VOLUME_UP ? "volume up" : "volume down",
+         p == Press::LONG ? "long" : "short");
     if (button_cb) button_cb(b, p);
   }
 
@@ -103,12 +109,21 @@ struct Input::Impl {
           emit(Button::ACTION, Press::LONG);
         });
       } else if (value == 0 && action_down) {
+        const int64_t now = Loop::now_ms(), held = now - action_down;
         action_down = 0;
         if (action_timer) {
           loop.cancel_timer(action_timer);
           action_timer = 0;
         }
-        if (!action_long_sent) emit(Button::ACTION, Press::SHORT);
+        if (action_long_sent) return;
+        // Capacitive noise (a hand near the top, flipping the mute switch) produces very short
+        // touches, often in bursts; maind's "buttonsClickLimiter" drops the same.
+        if (held < kMinActionPressMs || now - last_action_ms < kMinActionGapMs) {
+          LOGI("input: action touch ignored (held %lld ms)", (long long)held);
+          return;
+        }
+        last_action_ms = now;
+        emit(Button::ACTION, Press::SHORT);
       }
       return;
     }
