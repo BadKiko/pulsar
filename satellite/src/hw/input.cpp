@@ -9,7 +9,8 @@
 //   press/release events are ignored, the switch state is authoritative (initial value via
 //   EVIOCGSW).
 // ACTION: SHORT on release before 800 ms, LONG as soon as it has been held for 800 ms.
-// VOLUME_*: SHORT on press, auto-repeated every 200 ms after being held for 500 ms.
+// VOLUME_*: SHORT on press, auto-repeated every 200 ms after being held for 500 ms, for at most 10 s.
+// Devices that disappear (ENODEV) are looked up again every 3 s; SYN_DROPPED triggers a state resync.
 #include <fcntl.h>
 #include <linux/input.h>
 #include <sys/epoll.h>
@@ -32,6 +33,8 @@ constexpr int kKeyAction = 582;  // KEY_VOICECOMMAND
 constexpr int64_t kLongPressMs = 800;
 constexpr int64_t kRepeatDelayMs = 500;
 constexpr int64_t kRepeatMs = 200;
+constexpr int64_t kMaxHoldMs = 10000;  // a key held longer than this is taken as stuck
+constexpr int64_t kReopenMs = 3000;    // retry period for missing/vanished input devices
 
 // Finds /dev/input/eventN for the device with the given name.
 std::string find_event_dev(const std::string &name) {
@@ -74,20 +77,38 @@ struct Input::Impl {
   uint64_t action_timer = 0;
   uint64_t repeat_timer = 0;
   int repeat_code = 0;
+  int64_t repeat_since = 0;
+  uint64_t retry_timer = 0;
+  // After SYN_DROPPED the kernel discards events up to the next SYN_REPORT; the state is then
+  // read back from the device.
+  bool keys_dropped = false, mute_dropped = false;
 
   ~Impl() {
-    for (uint64_t t : {action_timer, repeat_timer})
+    for (uint64_t t : {action_timer, repeat_timer, retry_timer})
       if (t) loop.cancel_timer(t);
-    for (int fd : {keys_fd, mute_fd})
-      if (fd >= 0) {
-        loop.del_fd(fd);
-        close(fd);
-      }
+    close_dev(keys_fd);
+    close_dev(mute_fd);
+  }
+
+  void close_dev(int &fd) {
+    if (fd < 0) return;
+    loop.del_fd(fd);
+    close(fd);
+    fd = -1;
   }
 
   void emit(Button b, Press p) {
     LOGD("input: button %d press %d", int(b), int(p));
     if (button_cb) button_cb(b, p);
+  }
+
+  // Forgets every pressed key (device lost or events dropped): no release will ever arrive.
+  void release_all() {
+    if (action_timer) loop.cancel_timer(action_timer);
+    if (repeat_timer) loop.cancel_timer(repeat_timer);
+    action_timer = repeat_timer = 0;
+    action_down = 0;
+    repeat_code = 0;
   }
 
   void on_key(int code, int value) {
@@ -99,6 +120,12 @@ struct Input::Impl {
           action_timer = 0;
           action_long_sent = true;
           emit(Button::ACTION, Press::LONG);
+          // Stuck-key guard: a release that never arrives must not block later presses.
+          action_timer = loop.add_timer(kMaxHoldMs - kLongPressMs, [this] {
+            action_timer = 0;
+            action_down = 0;
+            LOGW("input: action key held > %d s, assuming released", int(kMaxHoldMs / 1000));
+          });
         });
       } else if (value == 0 && action_down) {
         action_down = 0;
@@ -119,9 +146,19 @@ struct Input::Impl {
       emit(b, Press::SHORT);
       if (repeat_timer) loop.cancel_timer(repeat_timer);
       repeat_code = code;
+      repeat_since = Loop::now_ms();
       repeat_timer = loop.add_timer(kRepeatDelayMs, [this, b] {
         if (repeat_timer) loop.cancel_timer(repeat_timer);
-        repeat_timer = loop.add_timer(kRepeatMs, [this, b] { emit(b, Press::SHORT); }, kRepeatMs);
+        repeat_timer = loop.add_timer(kRepeatMs, [this, b] {
+          if (Loop::now_ms() - repeat_since > kMaxHoldMs) {
+            LOGW("input: volume key held > %d s, assuming released", int(kMaxHoldMs / 1000));
+            loop.cancel_timer(repeat_timer);
+            repeat_timer = 0;
+            repeat_code = 0;
+            return;
+          }
+          emit(b, Press::SHORT);
+        }, kRepeatMs);
         emit(b, Press::SHORT);
       });
     } else if (value == 0 && repeat_code == code) {
@@ -138,40 +175,89 @@ struct Input::Impl {
     if (mute_cb) mute_cb(m);
   }
 
+  void read_mute_state() {
+    unsigned long sw[(SW_MAX + 1 + 8 * sizeof(long) - 1) / (8 * sizeof(long))] = {};
+    if (ioctl(mute_fd, EVIOCGSW(sizeof sw), sw) >= 0) set_muted(test_bit(sw, SW_MUTE_DEVICE));
+    else LOGW("input: EVIOCGSW: %s", strerror(errno));
+  }
+
+  // Key state after lost events: synthesize the releases we missed (presses are not invented).
+  void resync_keys() {
+    unsigned long keys[KEY_MAX / (8 * sizeof(long)) + 1] = {};
+    if (ioctl(keys_fd, EVIOCGKEY(sizeof keys), keys) < 0) {
+      LOGW("input: EVIOCGKEY: %s", strerror(errno));
+      release_all();
+      return;
+    }
+    if (action_down && !test_bit(keys, kKeyAction)) on_key(kKeyAction, 0);
+    if (repeat_code && !test_bit(keys, repeat_code)) on_key(repeat_code, 0);
+  }
+
   void drain(int fd) {
     input_event ev[16];
     for (;;) {
       ssize_t n = read(fd, ev, sizeof ev);
       if (n < 0) {
-        if (errno != EAGAIN && errno != EINTR) LOGE("input: read: %s", strerror(errno));
-        if (errno == ENODEV) {
-          loop.del_fd(fd);
+        if (errno == EAGAIN || errno == EINTR) return;
+        LOGE("input: read: %s", strerror(errno));
+        if (fd == keys_fd) {
+          release_all();
+          close_dev(keys_fd);
+        } else if (fd == mute_fd) {
+          close_dev(mute_fd);
         }
-        return;
+        return;  // retry_timer reopens it
       }
       if (n == 0) return;
       for (size_t i = 0; i < size_t(n) / sizeof(input_event); i++) {
         const auto &e = ev[i];
-        if (e.type == EV_KEY && fd == keys_fd) on_key(e.code, e.value);
+        bool is_keys = fd == keys_fd;
+        bool &dropped = is_keys ? keys_dropped : mute_dropped;
+        if (e.type == EV_SYN) {
+          if (e.code == SYN_DROPPED) {
+            LOGW("input: events dropped on fd %d, resyncing", fd);
+            dropped = true;
+          } else if (e.code == SYN_REPORT && dropped) {
+            dropped = false;
+            if (is_keys) resync_keys();
+            else read_mute_state();
+          }
+          continue;
+        }
+        if (dropped) continue;
+        if (e.type == EV_KEY && is_keys) on_key(e.code, e.value);
         else if (e.type == EV_SW && e.code == SW_MUTE_DEVICE) set_muted(e.value != 0);
       }
     }
   }
 
-  int open_dev(const char *name) {
+  int open_dev(const char *name, bool quiet) {
     std::string path = find_event_dev(name);
     if (path.empty()) {
-      LOGE("input: device \"%s\" not found", name);
+      if (!quiet) LOGE("input: device \"%s\" not found", name);
       return -1;
     }
     int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
-      LOGE("input: open %s: %s", path.c_str(), strerror(errno));
+      if (!quiet) LOGE("input: open %s: %s", path.c_str(), strerror(errno));
       return -1;
     }
     LOGI("input: \"%s\" -> %s", name, path.c_str());
     loop.add_fd(fd, EPOLLIN, [this, fd](uint32_t) { drain(fd); });
     return fd;
+  }
+
+  // Devices that were missing at start or vanished (ENODEV) are looked up again.
+  void reopen_missing() {
+    if (keys_fd < 0) {
+      keys_fd = open_dev("awinic_sar", true);
+      keys_dropped = false;
+    }
+    if (mute_fd < 0) {
+      mute_fd = open_dev("mute", true);
+      mute_dropped = false;
+      if (mute_fd >= 0) read_mute_state();
+    }
   }
 };
 
@@ -180,17 +266,13 @@ Input::~Input() = default;
 
 bool Input::open() {
   auto &d = *impl_;
-  d.keys_fd = d.open_dev("awinic_sar");
-  d.mute_fd = d.open_dev("mute");
+  d.keys_fd = d.open_dev("awinic_sar", false);
+  d.mute_fd = d.open_dev("mute", false);
   if (d.mute_fd >= 0) {
-    unsigned long sw[(SW_MAX + 1 + 8 * sizeof(long) - 1) / (8 * sizeof(long))] = {};
-    if (ioctl(d.mute_fd, EVIOCGSW(sizeof sw), sw) >= 0) {
-      d.muted = test_bit(sw, SW_MUTE_DEVICE);
-      LOGI("input: initial hardware mute %s", d.muted ? "on" : "off");
-    } else {
-      LOGW("input: EVIOCGSW: %s", strerror(errno));
-    }
+    d.read_mute_state();
+    LOGI("input: initial hardware mute %s", d.muted ? "on" : "off");
   }
+  d.retry_timer = d.loop.add_timer(kReopenMs, [&d] { d.reopen_missing(); }, kReopenMs);
   return d.keys_fd >= 0 || d.mute_fd >= 0;
 }
 
