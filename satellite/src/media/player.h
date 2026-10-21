@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/loop.h"
+#include "model.h"
 
 namespace cs {
 
@@ -49,17 +50,25 @@ class Player {
   std::unique_ptr<Impl> impl_;
 };
 
-// Master output volume via ALSA control "Master Playback Volume" (softvol of the "speakers" PCM).
+// Master output volume via ALSA control "Master Playback Volume" (softvol of the "speakers" PCM),
+// on the stock curve of the model (Model::volume_map): volume v is platform level v * top level.
 class Mixer {
  public:
+  explicit Mixer(const Model &model) : model_(model) {}
   bool open();             // card 0
   float volume() const;    // 0..1
   void set_volume(float);  // 0..1
   bool muted() const;
   void set_muted(bool);
+  // A volume saved by builds before the stock curve (state.conf without volume_curve=2) -> the
+  // volume giving the same raw level now (levels below the lowest stock step rise to it).
+  float from_legacy(float v) const;
 
  private:
+  int to_raw(float v) const;
+  float from_raw(int raw) const;
   void apply();
+  const Model &model_;
   void *ctl_ = nullptr;
   float volume_ = 0.5f;
   bool muted_ = false;

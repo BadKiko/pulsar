@@ -668,27 +668,21 @@ void Player::on_state(StateCb cb) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Mixer: softvol "Master Playback Volume" on card 0 (2 values, 0..255, -60 dB..0 dB linear in dB,
-// TLV mute=0 i.e. raw 0 is -60 dB, not silence). The control is a user control that alsa-lib
-// creates the first time the "speakers" PCM is opened, so open() instantiates it if missing.
-//
-// Volume mapping (same as alsamixer's "mapped volume"): v = (10^(dB/60) - 0.1) / 0.9, i.e.
-// dB = 60 * log10(0.1 + 0.9 v). v=0 -> -60 dB (raw 0), v=0.5 -> -15.6 dB, v=1 -> 0 dB.
+// Mixer: softvol "Master Playback Volume" on card 0 (2 values, 0..255, linear in dB, Midi
+// -60 dB..0 dB; TLV mute=0, i.e. raw 0 is the bottom of the range, not silence). The control is a
+// user control that alsa-lib creates the first time the "speakers" PCM is opened, so open()
+// instantiates it if missing.
 
 namespace {
 constexpr const char *kMasterCtl = "Master Playback Volume";
-constexpr double kMinDb = -60.0;
 
-int vol_to_raw(float v) {
+// The curve before the stock map (alsamixer's "mapped volume" over a -60..0 dB control):
+// dB = 60 * log10(0.1 + 0.9 v). Kept only to migrate saved volumes.
+int legacy_raw(float v) {
   if (v <= 0.0f) return 0;
   double db = 60.0 * std::log10(0.1 + 0.9 * std::min(1.0f, v));
-  int raw = int(std::lround((db - kMinDb) / -kMinDb * 255.0));
+  int raw = int(std::lround((db + 60.0) / 60.0 * 255.0));
   return std::max(0, std::min(255, raw));
-}
-
-float raw_to_vol(int raw) {
-  double db = kMinDb + (-kMinDb) * raw / 255.0;
-  return float(std::max(0.0, (std::pow(10.0, db / 60.0) - 0.1) / 0.9));
 }
 
 bool find_master(snd_ctl_t *ctl) {
@@ -702,6 +696,33 @@ bool find_master(snd_ctl_t *ctl) {
   return snd_ctl_elem_info(ctl, info) == 0;
 }
 }  // namespace
+
+// Level p = v * top level, piecewise linear through the map. Any audible volume is at least the
+// lowest stock step (level 1): the stock firmware never sets the raw values between it and 0.
+int Mixer::to_raw(float v) const {
+  const auto &m = model_.volume_map;
+  if (v <= 0.0f || m.size() < 2) return 0;
+  const double p = std::min(1.0f, v) * m.back().level;
+  if (p <= m[1].level) return m[1].raw;
+  for (size_t i = 2; i < m.size(); i++)
+    if (p <= m[i].level)
+      return int(std::lround(m[i - 1].raw + (p - m[i - 1].level) * (m[i].raw - m[i - 1].raw) /
+                                                double(m[i].level - m[i - 1].level)));
+  return m.back().raw;
+}
+
+float Mixer::from_raw(int raw) const {
+  const auto &m = model_.volume_map;
+  if (m.size() < 2 || raw <= m[0].raw) return 0.0f;
+  for (size_t i = 1; i < m.size(); i++)
+    if (raw <= m[i].raw)
+      return float((m[i - 1].level + (raw - m[i - 1].raw) * (m[i].level - m[i - 1].level) /
+                                         double(m[i].raw - m[i - 1].raw)) /
+                   m.back().level);
+  return 1.0f;
+}
+
+float Mixer::from_legacy(float v) const { return from_raw(legacy_raw(v)); }
 
 bool Mixer::open() {
   snd_ctl_t *ctl = nullptr;
@@ -728,7 +749,7 @@ bool Mixer::open() {
   snd_ctl_elem_value_set_name(val, kMasterCtl);
   if (snd_ctl_elem_read(ctl, val) == 0) {
     int raw = snd_ctl_elem_value_get_integer(val, 0);
-    if (raw > 0) volume_ = raw_to_vol(raw);
+    if (raw > 0) volume_ = from_raw(raw);
     LOGI("mixer: master raw=%d -> volume %.2f", raw, volume_);
   }
   return true;
@@ -751,7 +772,7 @@ void Mixer::set_muted(bool m) {
 void Mixer::apply() {
   auto *ctl = static_cast<snd_ctl_t *>(ctl_);
   if (!ctl) return;
-  int raw = muted_ ? 0 : vol_to_raw(volume_);
+  int raw = muted_ ? 0 : to_raw(volume_);
   snd_ctl_elem_value_t *val;
   snd_ctl_elem_value_alloca(&val);
   snd_ctl_elem_value_set_interface(val, SND_CTL_ELEM_IFACE_MIXER);

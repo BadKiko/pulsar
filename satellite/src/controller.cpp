@@ -46,12 +46,14 @@ bool Settings::load(const std::string &path) {
   std::ifstream f(path);
   if (!f) return false;
   std::string line;
+  volume_curve = 1;  // files from before the key existed
   while (std::getline(f, line)) {
     auto eq = line.find('=');
     if (eq == std::string::npos) continue;
     std::string k = line.substr(0, eq), v = line.substr(eq + 1);
     float fv = strtof(v.c_str(), nullptr);
     if (k == "volume") volume = fv;
+    else if (k == "volume_curve") volume_curve = int(fv);
     else if (k == "muted") muted = v == "1";
     else if (k == "mic_muted") mic_muted = v == "1";
     else if (k == "clock_on") clock_on = v == "1";
@@ -76,8 +78,8 @@ void Settings::save(const std::string &path) const {
       LOGW("cannot write %s", tmp.c_str());
       return;
     }
-    f << "volume=" << volume << "\nmuted=" << muted << "\nmic_muted=" << mic_muted << "\nclock_on=" << clock_on
-      << "\nclock_brightness=" << clock_brightness << "\nlight_on=" << light.on
+    f << "volume=" << volume << "\nvolume_curve=" << volume_curve << "\nmuted=" << muted << "\nmic_muted=" << mic_muted
+      << "\nclock_on=" << clock_on << "\nclock_brightness=" << clock_brightness << "\nlight_on=" << light.on
       << "\nlight_brightness=" << light.brightness << "\nlight_r=" << light.r << "\nlight_g=" << light.g
       << "\nlight_b=" << light.b << "\nlight_effect=" << light.effect << "\nwake_word=" << wake_word
       << "\ntz=" << tz << "\n";
@@ -93,6 +95,7 @@ Controller::Controller(Loop &loop, const Model &model, const std::string &state_
       state_path_(state_path),
       mic_(loop, model),
       player_(loop),
+      mixer_(model),
       leds_(loop, model),
       clock_(loop, model),
       input_(loop, model),
@@ -144,8 +147,17 @@ bool Controller::start() {
 
   if (!mixer_.open()) LOGW("mixer unavailable");
   // First run: keep the volume the speaker already had, but never start loud: on the Lite 2 the
-  // softvol control is at 0 dB (100 %) after boot until the Yandex stack sets it.
-  if (!have_state) st_.volume = std::min(mixer_.volume(), 0.3f);
+  // softvol control is at 0 dB (100 %) after boot until the Yandex stack sets it. 0.3 is stock
+  // level 6 of 20 (Alice's "3").
+  if (!have_state) {
+    st_.volume = std::min(mixer_.volume(), 0.3f);
+  } else if (st_.volume_curve < 2) {  // keep the speaker as loud as the saved volume made it
+    const float legacy = st_.volume;
+    st_.volume = mixer_.from_legacy(legacy);
+    st_.volume_curve = 2;
+    LOGI("volume %.3f on the legacy curve -> %.3f on the stock curve", legacy, st_.volume);
+    persist();
+  }
   mixer_.set_volume(st_.volume);
   mixer_.set_muted(st_.muted);
   if (!player_.init()) LOGE("player init failed");

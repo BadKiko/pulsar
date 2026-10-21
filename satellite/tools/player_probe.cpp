@@ -14,6 +14,7 @@
 #include "core/log.h"
 #include "core/loop.h"
 #include "media/player.h"
+#include "model.h"
 
 using namespace cs;
 
@@ -32,7 +33,9 @@ int main(int argc, char **argv) {
   int64_t t0 = Loop::now_ms();
   auto ts = [&] { return double(Loop::now_ms() - t0) / 1000.0; };
 
-  Mixer mixer;
+  const Model *model = detect_model();
+  if (!model) return 1;
+  Mixer mixer(*model);
   if (mixer.open()) {
     float orig = mixer.volume();
     printf("[%6.2f] mixer volume %.3f\n", ts(), orig);

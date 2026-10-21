@@ -45,6 +45,15 @@ struct Model {
   std::string keys_input, mute_input;  // evdev device names
   std::string error_sound;             // relative to /system/vendor/quasar/sounds/
 
+  // Stock volume curve: platform level -> raw value (0..255) of the softvol "Master Playback
+  // Volume" on the speakers PCM, piecewise linear between the points; the first point is level 0
+  // (raw 0), the last one the top level. quasar.cfg volume_capability.volume_manager_settings
+  // .platformToAlsaMap; the platform level steps by 5 % (changeStepPercent).
+  struct VolumePoint {
+    int level, raw;
+  };
+  std::vector<VolumePoint> volume_map;
+
   // Default Sendspin output delay: the firmware's multiroom hint, not an acoustic measurement
   // (quasar.cfg "multiroomd": {"latency_ms": -N}, i.e. Yandex's multiroom daemon plays N ms early).
   // snd_pcm_delay() already covers our ring, plug and dmix; this is the hardware path behind it

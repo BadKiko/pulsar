@@ -18,6 +18,7 @@ namespace cs {
 
 struct Settings {
   float volume = 0.5f;
+  int volume_curve = 2;        // curve volume was saved under: 2 = stock map (Model::volume_map), 1 = legacy
   bool muted = false;          // media mute
   bool mic_muted = false;      // software microphone mute
   bool clock_on = true;
