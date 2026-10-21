@@ -309,7 +309,8 @@ void Controller::on_voice_event(VaEvent type, const std::map<std::string, std::s
     auto it = data.find(k);
     return it == data.end() ? std::string() : it->second;
   };
-  LOGD("voice event %u", (unsigned)type);
+  // Numbers: VaEvent (1 run-start, 2 run-end, 3/4 stt, 5/6 intent, 7/8 tts, 11/12 vad, 0 error).
+  if (type != VaEvent::INTENT_PROGRESS) LOGI("voice event %u", (unsigned)type);
   switch (type) {
     case VaEvent::RUN_START:
       tts_url_ = get("url");
