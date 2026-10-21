@@ -272,8 +272,12 @@ void MdnsResponder::on_netlink() {
       if (errno == ENOBUFS) relevant = link_up = true;  // overflowed: something happened, recheck
       break;
     }
-    int len = int(n);
-    for (auto *h = reinterpret_cast<nlmsghdr *>(buf); NLMSG_OK(h, len); h = NLMSG_NEXT(h, len)) {
+    // NLMSG_OK/NLMSG_NEXT spelled out with size_t: the macros mix int and __u32 (-Wsign-compare).
+    size_t left = size_t(n);
+    for (auto *h = reinterpret_cast<nlmsghdr *>(buf);
+         left >= sizeof(nlmsghdr) && h->nlmsg_len >= sizeof(nlmsghdr) && h->nlmsg_len <= left;
+         left -= std::min<size_t>(left, NLMSG_ALIGN(h->nlmsg_len)),
+              h = reinterpret_cast<nlmsghdr *>(reinterpret_cast<char *>(h) + NLMSG_ALIGN(h->nlmsg_len))) {
       if (h->nlmsg_type == RTM_NEWADDR || h->nlmsg_type == RTM_DELADDR) {
         auto *ifa = static_cast<ifaddrmsg *>(NLMSG_DATA(h));
         if (ifa->ifa_family == AF_INET) relevant = true;
