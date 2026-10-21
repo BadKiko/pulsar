@@ -51,6 +51,21 @@ crash report `main.cpp` writes to the log (non-PIE: addresses are absolute). The
 `git describe --always --dirty` (`--version`, HA DeviceInfo and the "Version" entity). There is no host test
 suite; verification happens on the device.
 
+CI (`.github/workflows/build.yml`) builds the daemon and every tool for both architectures on each
+pull request and push to `main`; the binaries are attached to the run as artifacts. Pushing a tag
+`v*` additionally publishes a GitHub release with both stripped binaries, their `.debug` files and
+`SHA256SUMS`.
+
+## Branches
+
+`main` is the only long-lived branch and is protected by a repository ruleset: no direct pushes,
+force pushes or deletion; changes land through a pull request with green `build (aarch64)` and
+`build (armhf)` checks, squash or rebase only (linear history). Work on a short-lived branch
+(`feat/…`, `fix/…`, `docs/…`), open a PR, merge; the branch is deleted on merge. Release tags `v*`
+cannot be moved or deleted. Nothing personal goes into the repository: no real IPs, MACs, serials,
+Wi-Fi names, tokens, device logs or names/e-mails in commits (`192.168.1.50` is the documentation
+placeholder).
+
 ## Deploy
 
 ```sh
