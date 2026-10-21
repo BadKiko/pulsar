@@ -30,6 +30,8 @@ class MdnsResponder {
   void add_service(std::string service, std::string instance, uint16_t port, std::vector<std::string> txt);
   // Replaces the TXT records of a service added earlier (e.g. "_esphomelib._tcp") and announces it.
   void set_txt(const std::string &service, std::vector<std::string> txt);
+  // IPv4 address being advertised (network byte order), 0 when there is none.
+  uint32_t ipv4() const { return ip_; }
 
  private:
   struct Service {

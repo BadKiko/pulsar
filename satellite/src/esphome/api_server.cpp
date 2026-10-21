@@ -44,12 +44,14 @@ enum Msg : uint32_t {
   LIST_LIGHT = 15,
   LIST_SENSOR = 16,
   LIST_SWITCH = 17,
+  LIST_TEXT_SENSOR = 18,
   LIST_DONE = 19,
   SUBSCRIBE_STATES_REQ = 20,
   BINARY_SENSOR_STATE = 21,
   LIGHT_STATE = 24,
   SENSOR_STATE = 25,
   SWITCH_STATE = 26,
+  TEXT_SENSOR_STATE = 27,
   SUBSCRIBE_LOGS_REQ = 28,
   SUBSCRIBE_LOGS_RESP = 29,
   LIGHT_CMD = 32,
@@ -61,6 +63,8 @@ enum Msg : uint32_t {
   LIST_NUMBER = 49,
   NUMBER_STATE = 50,
   NUMBER_CMD = 51,
+  LIST_BUTTON = 61,
+  BUTTON_CMD = 62,
   LIST_MEDIA_PLAYER = 63,
   MEDIA_PLAYER_STATE = 64,
   MEDIA_PLAYER_CMD = 65,
@@ -93,6 +97,11 @@ enum Key : uint32_t {
   K_NUMBER_CLOCK_BRI = 6,
   K_LIGHT_RING = 7,
   K_EVENT_BUTTON = 8,
+  K_BUTTON_RESTART = 9,
+  K_SENSOR_RSSI = 10,
+  K_SENSOR_UPTIME = 11,
+  K_TEXT_IP = 12,
+  K_TEXT_VERSION = 13,
 };
 
 // aioesphomeapi VoiceAssistantFeature bits.
@@ -109,7 +118,8 @@ constexpr uint32_t kMediaFeatures = MPF_PAUSE | MPF_VOLUME_SET | MPF_VOLUME_MUTE
 
 constexpr uint32_t ENTITY_CATEGORY_CONFIG = 1, ENTITY_CATEGORY_DIAGNOSTIC = 2;
 constexpr uint32_t COLOR_MODE_RGB = 35;
-constexpr uint32_t STATE_CLASS_MEASUREMENT = 1;
+constexpr uint32_t STATE_CLASS_MEASUREMENT = 1, STATE_CLASS_TOTAL_INCREASING = 2;
+constexpr int64_t kDiagPeriodMs = 60000;  // Wi-Fi signal / uptime / IP refresh
 constexpr uint32_t NUMBER_MODE_SLIDER = 2;
 constexpr uint32_t FORMAT_PURPOSE_DEFAULT = 0, FORMAT_PURPOSE_ANNOUNCEMENT = 1;
 
@@ -171,6 +181,24 @@ bool decode_psk(const std::string &in, Psk *out) {
     }
   }
   return n == out->size();
+}
+
+// wlan0 signal level in dBm from /proc/net/wireless ("wlan0: 0000   58.  -52.  -256 ...").
+bool read_rssi(float *dbm) {
+  FILE *f = fopen("/proc/net/wireless", "re");
+  if (!f) return false;
+  char line[256];
+  bool ok = false;
+  while (fgets(line, sizeof line, f)) {
+    float link, level;
+    if (sscanf(line, " wlan0: %*x %f %f", &link, &level) == 2) {
+      *dbm = level;
+      ok = true;
+      break;
+    }
+  }
+  fclose(f);
+  return ok;
 }
 
 std::string trim(std::string s) {
@@ -296,6 +324,11 @@ struct ApiServer::Impl {
   BoolState sw_mic_mute, sw_clock, bs_hw_mute;
   FloatState lux, clock_bri;
   LightState light;
+  // Diagnostics, refreshed by diag_timer.
+  FloatState rssi;
+  uint32_t ip = 0;  // network byte order, as chosen by the mDNS responder
+  const int64_t started_ms = Loop::now_ms();
+  uint64_t diag_timer = 0;
 
   Impl(Loop &l, DeviceIdentity i, ApiConfig c, ApiHooks &h) : loop(l), id(std::move(i)), cfg(std::move(c)), hooks(h) {}
 
@@ -303,6 +336,7 @@ struct ApiServer::Impl {
   ~Impl() {
     log_set_sink(4, nullptr);
     if (tick_timer) loop.cancel_timer(tick_timer);
+    if (diag_timer) loop.cancel_timer(diag_timer);
     for (auto &c : clients) {
       loop.del_fd(c->fd);
       if (c->hello) {
@@ -358,6 +392,7 @@ struct ApiServer::Impl {
     }
     loop.add_fd(listen_fd, EPOLLIN, [this](uint32_t) { on_accept(); });
     tick_timer = loop.add_timer(5000, [this] { tick(); }, 5000);
+    diag_timer = loop.add_timer(kDiagPeriodMs, [this] { refresh_diagnostics(true); }, kDiagPeriodMs);
     LOGI("api: listening on :%u as '%s'", cfg.port, id.name.c_str());
     load_key();
     mdns.reset(new MdnsResponder(loop, id.name, "_esphomelib._tcp", cfg.port, txt_records()));
@@ -1000,6 +1035,15 @@ struct ApiServer::Impl {
       case MEDIA_PLAYER_CMD:
         on_media_cmd(r);
         break;
+      case BUTTON_CMD: {
+        uint32_t key = 0;
+        while (r.next(f))
+          if (f.num == 1) key = f.u32();
+        if (key != K_BUTTON_RESTART) break;
+        LOGW("api: restart requested by %s", c->peer.c_str());
+        hooks.on_restart();
+        return;  // the server may be going away
+      }
       case SWITCH_CMD:
         on_switch_cmd(r);
         break;
@@ -1241,6 +1285,40 @@ struct ApiServer::Impl {
       for (const char *t : {"action", "action_long", "volume_up", "volume_down"}) w.str(9, t, true);
       send_msg(c, LIST_EVENT, w);
     }
+    {
+      pb::Writer w;
+      entity_head(w, "restart", K_BUTTON_RESTART, "Restart");
+      w.u32(7, ENTITY_CATEGORY_CONFIG);
+      w.str(8, "restart");
+      send_msg(c, LIST_BUTTON, w);
+    }
+    {
+      pb::Writer w;
+      entity_head(w, "wifi_signal", K_SENSOR_RSSI, "Wi-Fi signal");
+      w.str(6, "dBm");
+      w.str(9, "signal_strength");
+      w.u32(10, STATE_CLASS_MEASUREMENT);
+      w.u32(13, ENTITY_CATEGORY_DIAGNOSTIC);
+      send_msg(c, LIST_SENSOR, w);
+    }
+    {
+      pb::Writer w;
+      entity_head(w, "uptime", K_SENSOR_UPTIME, "Uptime");
+      w.str(6, "s");
+      w.str(9, "duration");
+      w.u32(10, STATE_CLASS_TOTAL_INCREASING);
+      w.u32(13, ENTITY_CATEGORY_DIAGNOSTIC);
+      send_msg(c, LIST_SENSOR, w);
+    }
+    auto text = [&](const char *oid, uint32_t key, const char *name, const char *icon) {
+      pb::Writer w;
+      entity_head(w, oid, key, name);
+      w.str(5, icon);
+      w.u32(7, ENTITY_CATEGORY_DIAGNOSTIC);
+      send_msg(c, LIST_TEXT_SENSOR, w);
+    };
+    text("ip_address", K_TEXT_IP, "IP address", "mdi:ip-network");
+    text("version", K_TEXT_VERSION, "Version", "mdi:new-box");
     send_msg(c, LIST_DONE, pb::Writer());
   }
 
@@ -1307,6 +1385,42 @@ struct ApiServer::Impl {
     send_float(SENSOR_STATE, K_SENSOR_LUX, lux, c);
     send_float(NUMBER_STATE, K_NUMBER_CLOCK_BRI, clock_bri, c);
     send_light(c);
+    refresh_diagnostics(false);
+    send_float(SENSOR_STATE, K_SENSOR_RSSI, rssi, c);
+    send_uptime(c);
+    send_ip(c);
+    send_text(K_TEXT_VERSION, id.project_version, true, c);
+  }
+
+  void send_text(uint32_t key, const std::string &s, bool has, const ClientPtr &to = nullptr) {
+    pb::Writer w;
+    w.fixed32(1, key, true);
+    w.str(2, s);
+    w.boolean(3, !has);
+    emit(to, TEXT_SENSOR_STATE, w);
+  }
+  void send_ip(const ClientPtr &to = nullptr) {
+    char buf[INET_ADDRSTRLEN] = "";
+    if (ip) inet_ntop(AF_INET, &ip, buf, sizeof buf);
+    send_text(K_TEXT_IP, buf, ip != 0, to);
+  }
+  void send_uptime(const ClientPtr &to = nullptr) {
+    send_float(SENSOR_STATE, K_SENSOR_UPTIME, {true, float((Loop::now_ms() - started_ms) / 1000)}, to);
+  }
+
+  // RSSI and uptime go out every period, the IP only when it changes; publish=false only
+  // refreshes the cache (initial states are sent by the caller).
+  void refresh_diagnostics(bool publish) {
+    float dbm;
+    rssi.has = read_rssi(&dbm);
+    if (rssi.has) rssi.v = dbm;
+    uint32_t now_ip = mdns ? mdns->ipv4() : 0;
+    bool ip_changed = now_ip != ip;
+    ip = now_ip;
+    if (!publish || !states_on()) return;
+    send_float(SENSOR_STATE, K_SENSOR_RSSI, rssi);
+    send_uptime();
+    if (ip_changed) send_ip();
   }
 
   // ---------------------------------------------------------------- commands

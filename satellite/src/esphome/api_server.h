@@ -128,6 +128,9 @@ class ApiHooks {
   // The link to HA fell too far behind to carry mic audio; the server already sent
   // VoiceAssistantRequest(start=false), so the controller should end the pipeline locally.
   virtual void on_voice_audio_overflow() {}
+  // "Restart" button. The daemon should leave the loop and exit 0 (supervise.sh restarts it);
+  // the call may destroy the server, so it is the last thing the server does for that message.
+  virtual void on_restart() {}
 };
 
 struct ApiConfig {
