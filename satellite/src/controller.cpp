@@ -477,43 +477,18 @@ void Controller::end_announce() {
 // ---------------- timers ----------------
 
 void Controller::on_timer_event(const TimerInfo &t) {
-  LOGI("timer %u '%s' left=%u active=%d", (unsigned)t.event, t.name.c_str(), t.seconds_left, t.is_active);
+  LOGI("timer %u '%s' (%s) left=%u active=%d", (unsigned)t.event, t.name.c_str(), t.id.c_str(), t.seconds_left,
+       t.is_active);
   switch (t.event) {
     case TimerEvent::STARTED:
     case TimerEvent::UPDATED:
-      if (t.is_active) {
-        timer_end_ms_ = Loop::now_ms() + int64_t(t.seconds_left) * 1000;
-        if (!timer_tick_)
-          timer_tick_ = loop_.add_timer(
-              0,
-              [this] {
-                int64_t left = timer_end_ms_ - Loop::now_ms();
-                if (timer_end_ms_ == 0 || left <= 0) {
-                  clock_.set_timer(0);
-                  loop_.cancel_timer(timer_tick_);
-                  timer_tick_ = 0;
-                  return;
-                }
-                clock_.set_timer(uint32_t((left + 999) / 1000));
-              },
-              500);
-      } else {  // paused
-        if (timer_tick_) loop_.cancel_timer(timer_tick_);
-        timer_tick_ = 0;
-        clock_.set_timer(t.seconds_left);
-      }
+      timers_[t.id] = HaTimer{t.is_active, Loop::now_ms() + int64_t(t.seconds_left) * 1000, t.seconds_left};
       break;
     case TimerEvent::CANCELLED:
-      timer_end_ms_ = 0;
-      if (timer_tick_) loop_.cancel_timer(timer_tick_);
-      timer_tick_ = 0;
-      clock_.set_timer(0);
+      timers_.erase(t.id);
       break;
     case TimerEvent::FINISHED:
-      timer_end_ms_ = 0;
-      if (timer_tick_) loop_.cancel_timer(timer_tick_);
-      timer_tick_ = 0;
-      clock_.set_timer(0);
+      timers_.erase(t.id);
       if (!timer_ringing_) {
         timer_ringing_ = true;
         timer_ring_started_ms_ = Loop::now_ms();
@@ -523,6 +498,31 @@ void Controller::on_timer_event(const TimerInfo &t) {
       }
       break;
   }
+  show_timers();
+}
+
+// The clock shows the running timer that ends first, else the paused one with the least time
+// left. Clock::set_timer counts down on its own, so a paused value is re-set on every tick.
+void Controller::show_timers() {
+  const int64_t now = Loop::now_ms();
+  int64_t best = -1;
+  bool best_active = false;
+  for (const auto &[id, tm] : timers_) {
+    const int64_t left = tm.active ? tm.end_ms - now : int64_t(tm.seconds_left) * 1000;
+    if (left <= 0) continue;  // ran out locally; HA's FINISHED follows
+    if (best < 0 || (tm.active && !best_active) || (tm.active == best_active && left < best)) {
+      best = left;
+      best_active = tm.active;
+    }
+  }
+  if (best < 0) {
+    clock_.set_timer(0);
+    if (timer_tick_) loop_.cancel_timer(timer_tick_);
+    timer_tick_ = 0;
+    return;
+  }
+  clock_.set_timer(uint32_t((best + 999) / 1000));
+  if (!timer_tick_) timer_tick_ = loop_.add_timer(500, [this] { show_timers(); }, 500);
 }
 
 // The ring gives the ANNOUNCE channel to speech (TTS answer, HA announcement) and resumes after it.

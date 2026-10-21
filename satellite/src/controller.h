@@ -2,6 +2,7 @@
 // Voice-satellite behaviour follows OHF linux-voice-assistant (satellite.py).
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 
@@ -72,6 +73,7 @@ class Controller : public ApiHooks {
   void stop_timer_ring();
   void ring_timer();
   void resume_ring();
+  void show_timers();
   void update_ui();
   void update_detection();
   void update_duck();
@@ -116,8 +118,13 @@ class Controller : public ApiHooks {
   bool ring_yielded_ = false;  // the ring gave the ANNOUNCE channel to speech; resume_ring() continues it
   uint64_t timer_ring_tick_ = 0;
   int64_t timer_ring_started_ms_ = 0;
-  int64_t timer_end_ms_ = 0;  // active countdown shown on the clock (0 = none)
-  uint64_t timer_tick_ = 0;
+  struct HaTimer {
+    bool active;
+    int64_t end_ms;         // while active
+    uint32_t seconds_left;  // while paused
+  };
+  std::map<std::string, HaTimer> timers_;  // HA timers by TimerInfo::id
+  uint64_t timer_tick_ = 0;                // clock refresh while a timer is shown
   // light sensor publishing
   float last_lux_published_ = -1;
   int64_t last_lux_ms_ = 0;
