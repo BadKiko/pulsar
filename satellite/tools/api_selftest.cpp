@@ -1,14 +1,19 @@
 // Self-test harness for the ESPHome API server: runs ApiServer with logging hooks so a real
 // client (aioesphomeapi / Home Assistant) can be pointed at it.
 //
-// Usage: api_selftest [port=16053] [name=cucumber-selftest] [run_seconds=120]
+// Usage: api_selftest [port=16053] [name=cucumber-selftest] [run_seconds=120] [key_file]
+//
+// key_file: Noise key file as in the daemon's state dir (api_key, base64 of 32 bytes); without it
+// the server is plaintext-only and encryption unsupported. A key set from the client
+// (NoiseEncryptionSetKeyRequest) is written there.
 //
 // Behaviour:
 //  - hooks print "HOOK ..." lines on stdout and echo state back (switch/number/media/light);
 //  - once a client subscribes to the voice assistant it sends a start request (wake word
 //    "Алиса"), streams 20 x 512-sample audio chunks, then a stop request;
 //  - announcements are acknowledged with VoiceAssistantAnnounceFinished after 300 ms;
-//  - every 2 s the illuminance sensor is published and a button "action" event fired.
+//  - every 2 s the illuminance sensor is published and a button "action" event fired;
+//  - the "Restart" button stops the test (exit 0).
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -117,6 +122,13 @@ struct TestHooks : ApiHooks {
   void on_time(uint32_t epoch, const std::string &tz) override {
     printf("HOOK time epoch=%u tz='%s'\n", epoch, tz.c_str());
   }
+
+  void on_voice_start_failed() override { printf("HOOK voice_start_failed\n"); }
+  void on_voice_audio_overflow() override { printf("HOOK voice_audio_overflow\n"); }
+  void on_restart() override {
+    printf("HOOK restart\n");
+    loop.stop();
+  }
 };
 
 std::string read_mac() {
@@ -145,6 +157,7 @@ int main(int argc, char **argv) {
   cfg.wake_words = {{"alisa", "Алиса", {"ru"}}, {"yandex", "Яндекс", {"ru"}}};
   cfg.active_wake_words = {"alisa"};
   cfg.light_effects = {"Rainbow", "Pulse"};
+  if (argc > 4) cfg.key_path = argv[4];
   ApiServer srv(loop, id, cfg, hooks);
   hooks.srv = &srv;
 
