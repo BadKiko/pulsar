@@ -7,7 +7,7 @@ Guide for coding agents working on cucumber-satellite. User-facing docs: `README
 A native C++ daemon replacing the Yandex stack (`maind` / `quasar_launcher2`) on rooted Yandex
 Stations: Midi (`cucumber`: aarch64, glibc 2.36, 1 GB RAM) and Lite 2 (`plum`: 32-bit armhf,
 glibc 2.30, 237 MB RAM). It exposes the speaker to Home Assistant over the ESPHome Native API
-(plaintext, port 6053) and to Music Assistant as a Sendspin player (port 8928). Wake word, command
+(port 6053; plaintext until a Noise key is provisioned, then Noise) and to Music Assistant as a Sendspin player (port 8928). Wake word, command
 spotting and echo cancellation use the firmware's own proprietary libraries, loaded with `dlopen`
 at runtime; they are never copied into the repo.
 
@@ -45,7 +45,10 @@ armhf C++ release builds crash before `main`), make, git, curl, cmake ≥ 3.16, 
 first build fetches pinned dependencies into `satellite/third_party/src/` and builds an ALSA
 sysroot per architecture into `satellite/build/<arch>/sysroot/` (Midi: versioned like the
 firmware's alsa-lib; Lite 2: unversioned, exporting only `snd_*`, otherwise the daemon would import
-zig's compiler-rt helpers from libasound). Binaries are stripped (~1.7 MB). There is no host test
+zig's compiler-rt helpers from libasound). Outputs per arch: `cucumber-satellite` (stripped, the
+one deployed) and `cucumber-satellite.debug` (unstripped, line tables) for `addr2line -f -e` on the
+crash report `main.cpp` writes to the log (non-PIE: addresses are absolute). The version is
+`git describe --always --dirty` (`--version`, HA DeviceInfo and the "Version" entity). There is no host test
 suite; verification happens on the device.
 
 ## Deploy
@@ -68,10 +71,23 @@ ssh root@<ip> 'cd /data/cucumber-satellite && cp cucumber-satellite cucumber-sat
   mv cucumber-satellite.new cucumber-satellite && ./ctl.sh restart'
 ```
 
-Device layout: `/data/cucumber-satellite/{cucumber-satellite,.prev,boot.sh,supervise.sh,ctl.sh,
-state.conf,enabled,sendspin/}`. Log: `/tmp/cucumber-satellite.log` (`ctl.sh log N`). Boot chain:
+Device layout: `/data/cucumber-satellite/{cucumber-satellite,.prev,.bad,boot.sh,supervise.sh,
+ctl.sh,state.conf,api_key,enabled,sendspin/}`. `api_key`: ESPHome Noise PSK (base64 of 32 bytes,
+0600), written by HA's auto-provisioning or `ctl.sh api-key`; absent = plaintext (Noise with the
+all-zeros key is then accepted so HA can provision); corrupt = API fails closed. `.bad`: binary
+replaced by the crash-loop rollback. Log: `/tmp/cucumber-satellite.log` (`ctl.sh log N`; rotated
+at 1 MB by `supervise.sh`, one `.1` kept). Boot chain:
 `onboot.sh` (firmware) → `/data/quasar/rootkeeper.sh` → `boot.sh` → waits for quasar, `q stop` →
-`supervise.sh` restart loop while `enabled` exists.
+`supervise.sh` restart loop while `enabled` exists. `ctl.sh reload` restarts the supervisor itself
+(needed after replacing `supervise.sh`; `install.sh` does it when the script changed).
+
+Supervisor contract (`supervise.sh` header has the details): daemon exit 0 = deliberate restart
+(SIGTERM from `ctl.sh`, the HA "Restart" button via `on_restart`), restarted after 1 s and not
+counted as a crash. Anything else is a crash; backoff 3 s doubling to 30 s; 5 consecutive crashes
+each after < 300 s of uptime → swap in `.prev` (bad one kept as `.bad`); if that crash-loops too →
+remove `enabled` and start the Yandex stack. `install.sh` additionally checks the log after a
+marker ~10 s post-restart and offers to restore `.prev`. A pre-Noise binary rolled back onto a
+device whose HA already holds a key cannot talk to HA until the key is removed there.
 
 ## Device safety rules
 
@@ -82,8 +98,8 @@ state.conf,enabled,sendspin/}`. Log: `/tmp/cucumber-satellite.log` (`ctl.sh log 
 - Several devices may share one adb server: always pass `adb -s <serial>`.
 - `adb shell` on this firmware is a pty: output has `\r`, is not binary-safe (use push/pull) and
   the exit status is always 0 (see `sh_()` in `install.sh`).
-- Before replacing the binary, keep the working one as `.prev`. A crashing binary is restarted by
-  `supervise.sh` every 3 s; roll back with `.prev` or `ctl.sh disable` (starts the Yandex stack).
+- Before replacing the binary, keep the working one as `.prev` (the automatic rollback relies on
+  it). Manual escape: `.prev` or `ctl.sh disable` (starts the Yandex stack).
 - Do not open ESPHome API connections to a device that Home Assistant is using; test against a
   separate binary on another port with the service stopped (`ctl.sh disable` or kill the supervisor).
 - No volume changes or test sounds on a live speaker without the owner's consent; tests that play
@@ -145,3 +161,13 @@ through the 32-bit `libquasar_gstreamer.so`, Sendspin playback, LED animations b
 - Keep the ESPHome API server pending until a valid `HelloRequest`; probes must not displace HA.
 - State persisted in `state.conf` (key=value); add new keys with safe defaults.
 - Comments explain device facts and constraints, not what the code does.
+- ESPHome API: up to 4 clients after a valid hello; states go to all subscribers, the voice
+  pipeline to the latest voice subscriber (`on_voice_subscribed(false/true)` on hand-over).
+- `Player::play` done callback: called exactly once per `play()` on the Loop; `true` only if every
+  url played to its end; `stop()` or a replacing `play()` delivers `false` for the superseded list
+  (queued by that call, so it runs after the caller returns). Callers must check that the dialog /
+  announcement they belong to is still current (`dialog_`, `announce_seq_` in the controller).
+- Voice phases LISTENING/PROCESSING are bounded by a watchdog (30 s / 60 s without a pipeline
+  event); any new path into those phases must go through `start_pipeline`.
+- Volume: `Mixer` maps 0..1 to the stock curve in `Model::volume_map`; `state.conf`
+  `volume_curve=2` marks volumes saved on that curve (older ones are migrated once).
