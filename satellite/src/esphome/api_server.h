@@ -1,5 +1,6 @@
-// ESPHome native API server (plaintext framing) exposing this speaker to Home Assistant
-// as an assist satellite + media player + auxiliary entities.
+// ESPHome native API server exposing this speaker to Home Assistant as an assist satellite +
+// media player + auxiliary entities. Several clients may be connected (HA, log viewers); state
+// updates go to every client subscribed to states, the voice pipeline to one owner.
 // All methods must be called on the Loop thread. Hooks are invoked on the Loop thread.
 #pragma once
 
@@ -103,9 +104,12 @@ enum class EventId : uint32_t { BUTTON = 1 };             // event types: "actio
 class ApiHooks {
  public:
   virtual ~ApiHooks() = default;
+  // A client completed hello (called for each client).
   virtual void on_client_connected(const std::string &client_info) = 0;
+  // The last client that completed hello disconnected.
   virtual void on_client_disconnected() = 0;
-  // HA subscribed/unsubscribed to voice assistant (SubscribeVoiceAssistantRequest).
+  // The voice pipeline owner (SubscribeVoiceAssistantRequest) appeared/went away. When another
+  // client takes over the subscription, false is reported before true.
   virtual void on_voice_subscribed(bool subscribed) = 0;
   virtual void on_voice_event(VaEvent type, const std::map<std::string, std::string> &data) = 0;
   virtual void on_announce(const AnnounceRequest &req) = 0;
@@ -139,8 +143,8 @@ class ApiServer {
   ~ApiServer();
   bool start();  // binds TCP port and starts mDNS advertising (_esphomelib._tcp)
 
-  bool connected() const;         // an HA client completed hello
-  bool voice_subscribed() const;  // HA subscribed to voice assistant
+  bool connected() const;         // some client completed hello
+  bool voice_subscribed() const;  // a client owns the voice pipeline
   MdnsResponder *mdns();          // shared mDNS responder (null before start())
 
   // --- voice assistant (device -> HA) ---

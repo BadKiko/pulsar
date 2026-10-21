@@ -110,6 +110,8 @@ constexpr size_t kMaxFrame = 1 << 20;            // reject absurd frames
 constexpr size_t kAudioBacklogLimit = 256 << 10;  // end the voice run when the socket is this far behind
 constexpr size_t kMaxBacklog = 8 << 20;           // give up on a client that stopped reading
 constexpr size_t kReadPerWakeup = 64 << 10;
+constexpr size_t kMaxClients = 4;  // HA plus e.g. the ESPHome dashboard log viewer / aioesphomeapi tools
+constexpr size_t kMaxPending = 4;  // connections that have not sent a valid hello yet
 constexpr int64_t kHelloTimeoutMs = 15000;
 constexpr int64_t kIdlePingMs = 45000;
 constexpr int64_t kIdleDropMs = 100000;
@@ -169,6 +171,7 @@ struct ApiServer::Impl {
     std::string wbuf;
     size_t woff = 0;
     bool want_out = false;
+    bool closed = false;
     bool hello = false;
     bool states = false;
     bool voice = false;
@@ -178,17 +181,17 @@ struct ApiServer::Impl {
     bool ping_outstanding = false;
     int64_t last_time_req = 0;
   };
+  using ClientPtr = std::shared_ptr<Client>;
 
   Loop &loop;
   DeviceIdentity id;
   ApiConfig cfg;
   ApiHooks &hooks;
   int listen_fd = -1;
-  std::shared_ptr<Client> client;
-  // A new connection while a client is established stays pending until it sends a valid
-  // HelloRequest; only then does it replace the established client. Garbage/port probes
-  // therefore cannot knock Home Assistant off.
-  std::shared_ptr<Client> pending;
+  // All connections in accept order. A connection counts against kMaxClients only after a valid
+  // HelloRequest, and only then may it evict an established client, so port scanners and
+  // garbage cannot knock Home Assistant off. Iterate over a copy: closing erases from here.
+  std::vector<ClientPtr> clients;
   std::unique_ptr<MdnsResponder> mdns;
   uint64_t tick_timer = 0;
   bool audio_overflowed = false;  // mic audio stopped for this run (backlog)
@@ -205,21 +208,28 @@ struct ApiServer::Impl {
 
   ~Impl() {
     if (tick_timer) loop.cancel_timer(tick_timer);
-    for (auto *slot : {&client, &pending}) {
-      if (*slot) {
-        loop.del_fd((*slot)->fd);
-        close((*slot)->fd);
-        slot->reset();
-      }
+    for (auto &c : clients) {
+      loop.del_fd(c->fd);
+      close(c->fd);
     }
+    clients.clear();
     if (listen_fd >= 0) {
       loop.del_fd(listen_fd);
       close(listen_fd);
     }
   }
 
-  bool ready() const { return client && client->hello; }
-
+  bool ready() const {
+    return std::any_of(clients.begin(), clients.end(), [](const ClientPtr &c) { return c->hello; });
+  }
+  bool states_on() const {
+    return std::any_of(clients.begin(), clients.end(), [](const ClientPtr &c) { return c->hello && c->states; });
+  }
+  ClientPtr voice_client() const {
+    for (const auto &c : clients)
+      if (c->hello && c->voice) return c;
+    return nullptr;
+  }
   // ---------------------------------------------------------------- transport
 
   bool start() {
@@ -272,7 +282,11 @@ struct ApiServer::Impl {
         if (errno != EAGAIN && errno != EWOULDBLOCK) LOGW("api: accept: %s", strerror(errno));
         return;
       }
-      if (pending) close_pending("superseded by another connection");
+      size_t unauthenticated = size_t(std::count_if(clients.begin(), clients.end(), [](const ClientPtr &c) { return !c->hello; }));
+      if (unauthenticated >= kMaxPending) {
+        auto oldest = *std::find_if(clients.begin(), clients.end(), [](const ClientPtr &c) { return !c->hello; });
+        close_client(oldest, "superseded by newer connections");
+      }
       int one = 1;
       setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
       setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
@@ -282,81 +296,53 @@ struct ApiServer::Impl {
       c->fd = fd;
       c->peer = std::string(ip) + ":" + std::to_string(ntohs(sa.sin_port));
       c->connected_at = c->last_rx = Loop::now_ms();
-      if (client) {
-        pending = c;
-        LOGI("api: connection from %s (pending until hello)", c->peer.c_str());
-      } else {
-        client = c;
-        LOGI("api: connection from %s", c->peer.c_str());
-      }
+      clients.push_back(c);
+      LOGI("api: connection from %s", c->peer.c_str());
       loop.add_fd(fd, EPOLLIN | EPOLLRDHUP, [this, c](uint32_t ev) { on_client_event(c, ev); });
     }
   }
 
-  void close_client(const char *why) {
-    if (!client) return;
-    std::shared_ptr<Client> c = std::move(client);
-    client.reset();
+  void close_client(ClientPtr c, const char *why) {
+    if (c->closed) return;
+    c->closed = true;
     loop.del_fd(c->fd);
     close(c->fd);
-    LOGI("api: %s disconnected (%s)", c->peer.c_str(), why);
-    if (c->hello) {
-      if (c->voice) hooks.on_voice_subscribed(false);
-      hooks.on_client_disconnected();
+    c->fd = -1;
+    clients.erase(std::remove(clients.begin(), clients.end(), c), clients.end());
+    LOGI("api: %s %s (%s)", c->peer.c_str(), c->hello ? "disconnected" : "dropped", why);
+    if (!c->hello) return;
+    if (c->voice) hooks.on_voice_subscribed(false);
+    if (!ready()) hooks.on_client_disconnected();
+  }
+
+  // A client completing hello at the cap replaces the established client heard from least
+  // recently, never the voice client: a reconnecting HA whose old socket has not timed out yet
+  // gets in, and the old one goes.
+  void make_room() {
+    ClientPtr victim;
+    size_t established = 0;
+    for (const auto &c : clients) {
+      if (!c->hello) continue;
+      established++;
+      if (!victim || (victim->voice && !c->voice) || (victim->voice == c->voice && c->last_rx < victim->last_rx))
+        victim = c;
     }
+    if (established >= kMaxClients) close_client(victim, "replaced by a new connection");
   }
 
-  void close_pending(const char *why) {
-    if (!pending) return;
-    std::shared_ptr<Client> c = std::move(pending);
-    pending.reset();
-    loop.del_fd(c->fd);
-    close(c->fd);
-    LOGI("api: %s dropped (%s)", c->peer.c_str(), why);
-  }
-
-  void on_pending_event(const std::shared_ptr<Client> &c) {
-    bool eof = read_into(c);
-    const auto *p = reinterpret_cast<const uint8_t *>(c->rbuf.data());
-    if (!c->rbuf.empty()) {
-      if (p[0] != 0x00) return close_pending(p[0] == 0x01 ? "noise encryption requested (unsupported)" : "bad frame preamble");
-      size_t q = 1;
-      uint64_t len, type;
-      if (pb::get_varint(p, c->rbuf.size(), &q, &len) && pb::get_varint(p, c->rbuf.size(), &q, &type)) {
-        if (type != HELLO_REQ) return close_pending("message before hello");
-        if (len > kMaxFrame) return close_pending("frame too large");
-        if (c->rbuf.size() - q >= len) {  // complete HelloRequest: promote
-          std::shared_ptr<Client> keep = c;
-          pending.reset();
-          close_client("replaced by a new connection");
-          client = keep;
-          LOGI("api: %s took over the API connection", keep->peer.c_str());
-          process(keep, eof);
-          return;
-        }
-      } else if (c->rbuf.size() > 21) {
-        return close_pending("malformed frame header");
-      }
-    }
-    if (eof) close_pending("closed before hello");
-  }
-
-  void on_client_event(const std::shared_ptr<Client> &c, uint32_t ev) {
-    if (c == pending) return on_pending_event(c);
-    if (client != c) return;
+  void on_client_event(const ClientPtr &c, uint32_t ev) {
+    if (c->closed) return;
     if (ev & EPOLLOUT) {
-      flush();
-      if (client != c) return;
+      flush(c);
+      if (c->closed) return;
     }
-    if (ev & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) on_readable(c);
+    if (ev & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) process(c, read_into(c));
   }
-
-  void on_readable(const std::shared_ptr<Client> &c) { process(c, read_into(c)); }
 
   // Reads up to kReadPerWakeup bytes into c->rbuf; returns true on EOF/error. epoll is
   // level-triggered, so the rest is read on the next wakeup and a flooding peer cannot starve
   // the loop (capture hand-off, timers) or grow rbuf without bound before it is parsed.
-  bool read_into(const std::shared_ptr<Client> &c) {
+  bool read_into(const ClientPtr &c) {
     char buf[16384];
     bool eof = false;
     size_t got = 0;
@@ -384,54 +370,60 @@ struct ApiServer::Impl {
     return eof;
   }
 
-  void process(const std::shared_ptr<Client> &c, bool eof) {
+  void process(const ClientPtr &c, bool eof) {
     size_t pos = 0;
     const auto *p = reinterpret_cast<const uint8_t *>(c->rbuf.data());
-    while (client == c && pos < c->rbuf.size()) {
+    while (!c->closed && pos < c->rbuf.size()) {
       size_t avail = c->rbuf.size() - pos;
       if (p[pos] != 0x00) {
-        close_client(p[pos] == 0x01 ? "client requested noise encryption (unsupported)" : "bad frame preamble");
+        close_client(c, p[pos] == 0x01 ? "client requested noise encryption (unsupported)" : "bad frame preamble");
         return;
       }
       size_t q = pos + 1;
       uint64_t len, type;
       if (!pb::get_varint(p, c->rbuf.size(), &q, &len) || !pb::get_varint(p, c->rbuf.size(), &q, &type)) {
         if (avail > 21) {
-          close_client("malformed frame header");
+          close_client(c, "malformed frame header");
           return;
         }
         break;  // header incomplete
       }
       if (len > kMaxFrame) {
-        close_client("frame too large");
+        close_client(c, "frame too large");
         return;
       }
       if (c->rbuf.size() - q < len) break;  // payload incomplete
       handle(c, uint32_t(type), p + q, size_t(len));
       pos = q + size_t(len);
     }
-    if (client != c) return;
+    if (c->closed) return;
     c->rbuf.erase(0, pos);
-    if (eof) close_client("connection closed by peer");
+    if (eof) close_client(c, "connection closed by peer");
   }
 
-  void send_msg(uint32_t type, const pb::Writer &w) {
-    if (!client) return;
-    Client &c = *client;
-    if (c.woff && c.woff == c.wbuf.size()) {
-      c.wbuf.clear();
-      c.woff = 0;
+  void send_msg(const ClientPtr &c, uint32_t type, const pb::Writer &w) {
+    if (c->closed) return;
+    if (c->woff && c->woff == c->wbuf.size()) {
+      c->wbuf.clear();
+      c->woff = 0;
     }
-    c.wbuf.push_back(0);
-    pb::put_varint(c.wbuf, w.size());
-    pb::put_varint(c.wbuf, type);
-    c.wbuf += w.data();
-    flush();
+    c->wbuf.push_back(0);
+    pb::put_varint(c->wbuf, w.size());
+    pb::put_varint(c->wbuf, type);
+    c->wbuf += w.data();
+    flush(c);
   }
 
-  void flush() {
-    if (!client) return;
-    Client &c = *client;
+  // State updates go to every client that subscribed to states.
+  void broadcast(uint32_t type, const pb::Writer &w) {
+    auto snapshot = clients;
+    for (const auto &c : snapshot)
+      if (c->hello && c->states) send_msg(c, type, w);
+  }
+
+  void flush(const ClientPtr &cp) {
+    Client &c = *cp;
+    if (c.closed) return;
     while (c.woff < c.wbuf.size()) {
       ssize_t n = send(c.fd, c.wbuf.data() + c.woff, c.wbuf.size() - c.woff, MSG_NOSIGNAL);
       if (n > 0) {
@@ -441,7 +433,7 @@ struct ApiServer::Impl {
       if (n < 0 && errno == EINTR) continue;
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         if (c.wbuf.size() - c.woff > kMaxBacklog) {
-          close_client("client not reading");
+          close_client(cp, "client not reading");
           return;
         }
         if (c.woff > (64u << 10) && c.woff * 2 > c.wbuf.size()) {
@@ -455,7 +447,7 @@ struct ApiServer::Impl {
         return;
       }
       LOGW("api: send: %s", n < 0 ? strerror(errno) : "0 bytes");
-      close_client("write error");
+      close_client(cp, "write error");
       return;
     }
     c.wbuf.clear();
@@ -464,45 +456,46 @@ struct ApiServer::Impl {
       c.want_out = false;
       loop.mod_fd(c.fd, EPOLLIN | EPOLLRDHUP);
     }
-    if (c.close_after_flush) close_client("disconnect requested");
+    if (c.close_after_flush) close_client(cp, "disconnect requested");
   }
 
-  size_t backlog() const { return client ? client->wbuf.size() - client->woff : 0; }
+  static size_t backlog(const Client &c) { return c.wbuf.size() - c.woff; }
 
   void tick() {
-    if (pending && Loop::now_ms() - pending->connected_at > kHelloTimeoutMs) close_pending("no hello");
-    if (!client) return;
     int64_t now = Loop::now_ms();
-    if (!client->hello) {
-      if (now - client->connected_at > kHelloTimeoutMs) close_client("no hello");
-      return;
+    auto snapshot = clients;
+    for (const auto &c : snapshot) {
+      if (c->closed) continue;
+      if (!c->hello) {
+        if (now - c->connected_at > kHelloTimeoutMs) close_client(c, "no hello");
+        continue;
+      }
+      int64_t idle = now - c->last_rx;
+      if (idle > kIdleDropMs) {
+        close_client(c, "keepalive timeout");
+        continue;
+      }
+      if (idle > kIdlePingMs && !c->ping_outstanding) {
+        c->ping_outstanding = true;
+        send_msg(c, PING_REQ, pb::Writer());
+      }
+      if (!c->closed && now - c->last_time_req >= kTimeResyncMs) request_time(c);
     }
-    int64_t idle = now - client->last_rx;
-    if (idle > kIdleDropMs) {
-      close_client("keepalive timeout");
-      return;
-    }
-    if (idle > kIdlePingMs && !client->ping_outstanding) {
-      client->ping_outstanding = true;
-      send_msg(PING_REQ, pb::Writer());
-    }
-    if (client && now - client->last_time_req >= kTimeResyncMs) request_time();
   }
 
-  void request_time() {
-    if (!ready()) return;
-    client->last_time_req = Loop::now_ms();
-    send_msg(GET_TIME_REQ, pb::Writer());
+  void request_time(const ClientPtr &c) {
+    c->last_time_req = Loop::now_ms();
+    send_msg(c, GET_TIME_REQ, pb::Writer());
   }
 
   // ---------------------------------------------------------------- dispatch
 
-  void handle(const std::shared_ptr<Client> &c, uint32_t type, const uint8_t *p, size_t n) {
+  void handle(const ClientPtr &c, uint32_t type, const uint8_t *p, size_t n) {
     pb::Reader r(p, n);
     pb::Field f;
     if (!c->hello && type != HELLO_REQ && type != DISCONNECT_REQ && type != PING_REQ) {
       LOGW("api: message %u before hello", type);
-      close_client("protocol violation");
+      close_client(c, "protocol violation");
       return;
     }
     switch (type) {
@@ -519,44 +512,45 @@ struct ApiServer::Impl {
         w.u32(2, kApiMinor);
         w.str(3, std::string("cucumber-satellite ") + id.project_version, true);
         w.str(4, id.name, true);
-        send_msg(HELLO_RESP, w);
-        if (client != c) return;
-        LOGI("api: hello from '%s' (api %u.%u)", info.c_str(), major, minor);
+        if (!c->hello) make_room();
+        send_msg(c, HELLO_RESP, w);
+        if (c->closed) return;
+        LOGI("api: hello from '%s' (api %u.%u) at %s", info.c_str(), major, minor, c->peer.c_str());
         if (!c->hello) {
           c->hello = true;
           hooks.on_client_connected(info);
-          if (client == c) request_time();
+          if (!c->closed) request_time(c);
         }
         break;
       }
       case DISCONNECT_REQ:
         c->close_after_flush = true;
-        send_msg(DISCONNECT_RESP, pb::Writer());
+        send_msg(c, DISCONNECT_RESP, pb::Writer());
         break;
       case DISCONNECT_RESP:
-        close_client("disconnect acknowledged");
+        close_client(c, "disconnect acknowledged");
         break;
       case PING_REQ:
-        send_msg(PING_RESP, pb::Writer());
+        send_msg(c, PING_RESP, pb::Writer());
         break;
       case PING_RESP:
         break;
       case DEVICE_INFO_REQ:
-        send_device_info();
+        send_device_info(c);
         break;
       case DEVICE_CAPS_REQ: {
         pb::Writer va, w;
         va.u32(1, kVoiceFeatures);
         w.msg(2, va);
-        send_msg(DEVICE_CAPS_RESP, w);
+        send_msg(c, DEVICE_CAPS_RESP, w);
         break;
       }
       case LIST_ENTITIES_REQ:
-        list_entities();
+        list_entities(c);
         break;
       case SUBSCRIBE_STATES_REQ:
         c->states = true;
-        send_all_states();
+        send_all_states(c);
         break;
       case SUBSCRIBE_LOGS_REQ:
       case SUBSCRIBE_HA_SERVICES_REQ:
@@ -596,14 +590,27 @@ struct ApiServer::Impl {
           if (f.num == 1) sub = f.boolean();
           if (f.num == 2) flags = f.u32();
         }
-        LOGI("api: voice assistant %s (flags=%u)", sub ? "subscribed" : "unsubscribed", flags);
-        if (c->voice != sub) {
-          c->voice = sub;
-          hooks.on_voice_subscribed(sub);
+        LOGI("api: %s voice assistant %s (flags=%u)", c->peer.c_str(), sub ? "subscribed" : "unsubscribed", flags);
+        if (sub == c->voice) break;
+        if (!sub) {
+          c->voice = false;
+          hooks.on_voice_subscribed(false);
+          break;
         }
+        // One pipeline owner. Unlike ESPHome (first subscriber keeps it), the latest one wins:
+        // after a Wi-Fi drop HA resubscribes on a new socket while the dead one is still open.
+        if (ClientPtr prev = voice_client()) {
+          LOGW("api: voice assistant moves from %s to %s", prev->peer.c_str(), c->peer.c_str());
+          prev->voice = false;
+          hooks.on_voice_subscribed(false);
+          if (c->closed) break;
+        }
+        c->voice = true;
+        hooks.on_voice_subscribed(true);
         break;
       }
       case VA_RESPONSE: {
+        if (!c->voice) break;  // answers to our requests only come from the pipeline owner
         uint32_t port = 0;
         bool error = false;
         while (r.next(f)) {
@@ -619,6 +626,7 @@ struct ApiServer::Impl {
         break;
       }
       case VA_EVENT_RESP: {
+        if (!c->voice) break;
         uint32_t type_v = 0;
         std::map<std::string, std::string> data;
         while (r.next(f)) {
@@ -669,7 +677,7 @@ struct ApiServer::Impl {
         break;
       }
       case VA_CONFIG_REQ:
-        send_va_config();
+        send_va_config(c);
         break;
       case VA_SET_CONFIG: {
         std::vector<std::string> ids;
@@ -703,7 +711,7 @@ struct ApiServer::Impl {
 
   // ---------------------------------------------------------------- device info / entities
 
-  void send_device_info() {
+  void send_device_info(const ClientPtr &c) {
     pb::Writer w;
     w.str(2, id.name, true);
     w.str(3, id.mac, true);
@@ -715,7 +723,7 @@ struct ApiServer::Impl {
     w.str(12, id.manufacturer, true);
     w.str(13, id.friendly_name, true);
     w.u32(17, kVoiceFeatures);
-    send_msg(DEVICE_INFO_RESP, w);
+    send_msg(c, DEVICE_INFO_RESP, w);
   }
 
   static void entity_head(pb::Writer &w, const char *object_id, uint32_t key, const char *name) {
@@ -724,7 +732,7 @@ struct ApiServer::Impl {
     w.str(3, name, true);
   }
 
-  void list_entities() {
+  void list_entities(const ClientPtr &c) {
     {
       pb::Writer w;
       entity_head(w, "media_player", K_MEDIA, "Media Player");
@@ -741,13 +749,13 @@ struct ApiServer::Impl {
       fmt(2, FORMAT_PURPOSE_DEFAULT);
       fmt(1, FORMAT_PURPOSE_ANNOUNCEMENT);
       w.u32(11, kMediaFeatures);
-      send_msg(LIST_MEDIA_PLAYER, w);
+      send_msg(c, LIST_MEDIA_PLAYER, w);
     }
     auto sw = [&](const char *oid, uint32_t key, const char *name, const char *icon) {
       pb::Writer w;
       entity_head(w, oid, key, name);
       w.str(5, icon);
-      send_msg(LIST_SWITCH, w);
+      send_msg(c, LIST_SWITCH, w);
     };
     sw("mute_microphones", K_SW_MIC_MUTE, "Mute microphones", "mdi:microphone-off");
     sw("clock_display", K_SW_CLOCK, "Clock display", "mdi:clock-digital");
@@ -756,7 +764,7 @@ struct ApiServer::Impl {
       entity_head(w, "hardware_mic_mute", K_BS_HW_MIC_MUTE, "Hardware mic mute");
       w.str(8, "mdi:microphone-off");
       w.u32(9, ENTITY_CATEGORY_DIAGNOSTIC);
-      send_msg(LIST_BINARY_SENSOR, w);
+      send_msg(c, LIST_BINARY_SENSOR, w);
     }
     {
       pb::Writer w;
@@ -765,7 +773,7 @@ struct ApiServer::Impl {
       w.i32(7, 0);
       w.str(9, "illuminance");
       w.u32(10, STATE_CLASS_MEASUREMENT);
-      send_msg(LIST_SENSOR, w);
+      send_msg(c, LIST_SENSOR, w);
     }
     {
       pb::Writer w;
@@ -777,7 +785,7 @@ struct ApiServer::Impl {
       w.u32(10, ENTITY_CATEGORY_CONFIG);
       w.str(11, "%");
       w.u32(12, NUMBER_MODE_SLIDER);
-      send_msg(LIST_NUMBER, w);
+      send_msg(c, LIST_NUMBER, w);
     }
     {
       pb::Writer w;
@@ -786,7 +794,7 @@ struct ApiServer::Impl {
       for (const auto &e : cfg.light_effects) w.str(11, e, true);
       w.packed_u32(12, {COLOR_MODE_RGB});
       w.str(14, "mdi:led-strip-variant");
-      send_msg(LIST_LIGHT, w);
+      send_msg(c, LIST_LIGHT, w);
     }
     {
       pb::Writer w;
@@ -794,45 +802,51 @@ struct ApiServer::Impl {
       w.str(5, "mdi:gesture-tap-button");
       w.str(8, "button");
       for (const char *t : {"action", "action_long", "volume_up", "volume_down"}) w.str(9, t, true);
-      send_msg(LIST_EVENT, w);
+      send_msg(c, LIST_EVENT, w);
     }
-    send_msg(LIST_DONE, pb::Writer());
+    send_msg(c, LIST_DONE, pb::Writer());
   }
 
   // ---------------------------------------------------------------- states
+  // `to` = one client (initial states after SubscribeStatesRequest) or null = every subscriber.
 
-  bool states_on() const { return client && client->hello && client->states; }
+  void emit(const ClientPtr &to, uint32_t type, const pb::Writer &w) {
+    if (to)
+      send_msg(to, type, w);
+    else
+      broadcast(type, w);
+  }
 
-  void send_media() {
+  void send_media(const ClientPtr &to = nullptr) {
     pb::Writer w;
     w.fixed32(1, K_MEDIA, true);
     w.u32(2, uint32_t(media_state));
     w.flt(3, media_volume);
     w.boolean(4, media_muted);
-    send_msg(MEDIA_PLAYER_STATE, w);
+    emit(to, MEDIA_PLAYER_STATE, w);
   }
-  void send_switch(uint32_t key, const BoolState &s) {
+  void send_switch(uint32_t key, const BoolState &s, const ClientPtr &to = nullptr) {
     pb::Writer w;
     w.fixed32(1, key, true);
     w.boolean(2, s.v);
     w.boolean(4, !s.has);  // missing_state
-    send_msg(SWITCH_STATE, w);
+    emit(to, SWITCH_STATE, w);
   }
-  void send_binary(uint32_t key, const BoolState &s) {
+  void send_binary(uint32_t key, const BoolState &s, const ClientPtr &to = nullptr) {
     pb::Writer w;
     w.fixed32(1, key, true);
     w.boolean(2, s.v);
     w.boolean(3, !s.has);
-    send_msg(BINARY_SENSOR_STATE, w);
+    emit(to, BINARY_SENSOR_STATE, w);
   }
-  void send_float(uint32_t type, uint32_t key, const FloatState &s) {
+  void send_float(uint32_t type, uint32_t key, const FloatState &s, const ClientPtr &to = nullptr) {
     pb::Writer w;
     w.fixed32(1, key, true);
     w.flt(2, s.v);
     w.boolean(3, !s.has);
-    send_msg(type, w);
+    emit(to, type, w);
   }
-  void send_light() {
+  void send_light(const ClientPtr &to = nullptr) {
     // HA expects rgb normalised to max 1 with the scale carried in color_brightness.
     float m = std::max({light.r, light.g, light.b});
     pb::Writer w;
@@ -845,17 +859,17 @@ struct ApiServer::Impl {
     w.flt(5, m > 0 ? light.g / m : 1.0f);
     w.flt(6, m > 0 ? light.b / m : 1.0f);
     w.str(9, light.effect.empty() ? std::string("None") : light.effect);
-    send_msg(LIGHT_STATE, w);
+    emit(to, LIGHT_STATE, w);
   }
 
-  void send_all_states() {
-    send_media();
-    send_switch(K_SW_MIC_MUTE, sw_mic_mute);
-    send_switch(K_SW_CLOCK, sw_clock);
-    send_binary(K_BS_HW_MIC_MUTE, bs_hw_mute);
-    send_float(SENSOR_STATE, K_SENSOR_LUX, lux);
-    send_float(NUMBER_STATE, K_NUMBER_CLOCK_BRI, clock_bri);
-    send_light();
+  void send_all_states(const ClientPtr &c) {
+    send_media(c);
+    send_switch(K_SW_MIC_MUTE, sw_mic_mute, c);
+    send_switch(K_SW_CLOCK, sw_clock, c);
+    send_binary(K_BS_HW_MIC_MUTE, bs_hw_mute, c);
+    send_float(SENSOR_STATE, K_SENSOR_LUX, lux, c);
+    send_float(NUMBER_STATE, K_NUMBER_CLOCK_BRI, clock_bri, c);
+    send_light(c);
   }
 
   // ---------------------------------------------------------------- commands
@@ -953,7 +967,7 @@ struct ApiServer::Impl {
     if (states_on()) send_light();
   }
 
-  void send_va_config() {
+  void send_va_config(const ClientPtr &c) {
     pb::Writer w;
     for (const auto &ww : cfg.wake_words) {
       pb::Writer s;
@@ -964,7 +978,7 @@ struct ApiServer::Impl {
     }
     for (const auto &a : cfg.active_wake_words) w.str(2, a, true);
     w.u32(3, 1);
-    send_msg(VA_CONFIG_RESP, w);
+    send_msg(c, VA_CONFIG_RESP, w);
   }
 };
 
@@ -979,11 +993,12 @@ bool ApiServer::start() { return impl_->start(); }
 
 bool ApiServer::connected() const { return impl_->ready(); }
 
-bool ApiServer::voice_subscribed() const { return impl_->ready() && impl_->client->voice; }
+bool ApiServer::voice_subscribed() const { return impl_->voice_client() != nullptr; }
 MdnsResponder *ApiServer::mdns() { return impl_->mdns.get(); }
 
 void ApiServer::voice_request_start(const std::string &wake_word_phrase) {
-  if (!voice_subscribed()) {
+  auto vc = impl_->voice_client();
+  if (!vc) {
     LOGW("api: voice_request_start without a subscribed client");
     return;
   }
@@ -996,20 +1011,22 @@ void ApiServer::voice_request_start(const std::string &wake_word_phrase) {
   w.msg(4, audio);
   w.str(5, wake_word_phrase);
   impl_->audio_overflowed = false;
-  impl_->send_msg(VA_REQUEST, w);
+  impl_->send_msg(vc, VA_REQUEST, w);
 }
 
 void ApiServer::voice_request_stop() {
-  if (!voice_subscribed()) return;
+  auto vc = impl_->voice_client();
+  if (!vc) return;
   pb::Writer w;
   w.boolean(1, false);
-  impl_->send_msg(VA_REQUEST, w);
+  impl_->send_msg(vc, VA_REQUEST, w);
 }
 
 void ApiServer::voice_send_audio(const int16_t *pcm, size_t samples) {
-  if (!voice_subscribed() || !samples || impl_->audio_overflowed) return;
+  auto vc = impl_->voice_client();
+  if (!vc || !samples || impl_->audio_overflowed) return;
   // A hole in the utterance would make HA transcribe garbage: end the run instead.
-  if (impl_->backlog() > kAudioBacklogLimit) {
+  if (Impl::backlog(*vc) > kAudioBacklogLimit) {
     LOGW("api: network backlog, ending the voice pipeline");
     impl_->audio_overflowed = true;
     voice_request_stop();
@@ -1018,14 +1035,15 @@ void ApiServer::voice_send_audio(const int16_t *pcm, size_t samples) {
   }
   pb::Writer w;
   w.bytes(1, pcm, samples * sizeof(int16_t));
-  impl_->send_msg(VA_AUDIO, w);
+  impl_->send_msg(vc, VA_AUDIO, w);
 }
 
 void ApiServer::voice_announce_finished(bool success) {
-  if (!voice_subscribed()) return;
+  auto vc = impl_->voice_client();
+  if (!vc) return;
   pb::Writer w;
   w.boolean(1, success);
-  impl_->send_msg(VA_ANNOUNCE_FINISHED, w);
+  impl_->send_msg(vc, VA_ANNOUNCE_FINISHED, w);
 }
 
 void ApiServer::set_active_wake_words(const std::vector<std::string> &ids) { impl_->cfg.active_wake_words = ids; }
@@ -1073,7 +1091,7 @@ void ApiServer::fire_event(EventId, const std::string &event_type) {
   pb::Writer w;
   w.fixed32(1, K_EVENT_BUTTON, true);
   w.str(2, event_type, true);
-  impl_->send_msg(EVENT_RESP, w);
+  impl_->broadcast(EVENT_RESP, w);
 }
 
 }  // namespace cs
