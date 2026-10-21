@@ -605,10 +605,12 @@ struct ApiServer::Impl {
           if (f.num == 1) port = f.u32();
           if (f.num == 2) error = f.boolean();
         }
-        if (error)
+        if (error) {
           LOGW("api: HA failed to start the voice pipeline");
-        else
+          hooks.on_voice_start_failed();
+        } else {
           LOGI("api: voice pipeline started (%s audio)", port ? "UDP" : "API");
+        }
         break;
       }
       case VA_EVENT_RESP: {

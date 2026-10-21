@@ -118,6 +118,11 @@ class ApiHooks {
   virtual void on_number(NumberId id, float value) = 0;
   // Time from HA (GetTimeResponse); posix_tz is the POSIX TZ string (e.g. "MSK-3"), may be empty.
   virtual void on_time(uint32_t epoch_seconds, const std::string &posix_tz) {}
+  // HA answered VoiceAssistantRequest(start) with error=true: no pipeline will run.
+  virtual void on_voice_start_failed() {}
+  // The link to HA fell too far behind to carry mic audio; the server already sent
+  // VoiceAssistantRequest(start=false), so the controller should end the pipeline locally.
+  virtual void on_voice_audio_overflow() {}
 };
 
 struct ApiConfig {
