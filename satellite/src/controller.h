@@ -17,8 +17,12 @@
 namespace cs {
 
 struct Settings {
+  // Volume on the stock curve (Model::volume_map), state.conf volume2=. volume= keeps the same raw
+  // level on the curve of earlier builds, so a binary rolled back by supervise.sh plays as loud.
   float volume = 0.5f;
-  int volume_curve = 2;        // curve volume was saved under: 2 = stock map (Model::volume_map), 1 = legacy
+  bool has_volume = false;       // volume2= was present
+  float volume_legacy = -1;      // volume=; < 0: absent
+  bool legacy_on_stock = false;  // volume_curve=2: one interim build wrote volume= on the stock curve
   bool muted = false;          // media mute
   bool mic_muted = false;      // software microphone mute
   bool clock_on = true;
@@ -66,6 +70,7 @@ class Controller : public ApiHooks {
   void play_tts();
   void tts_finished(bool ok);
   void finish_interaction();
+  void voice_link_lost();
   void abort_dialog(const char *why);
   void arm_watchdog();
   void interrupt_speech();
@@ -78,6 +83,7 @@ class Controller : public ApiHooks {
   void update_ui();
   void update_detection();
   void update_duck();
+  void apply_gains();
   void set_volume(float v, bool feedback);
   void set_muted(bool m);
   void start_sendspin(const DeviceIdentity &id);
@@ -103,6 +109,13 @@ class Controller : public ApiHooks {
   bool hw_mic_muted_ = false;
   bool error_shown_ = false;
   uint64_t watchdog_ = 0;  // loop timer ending a LISTENING/PROCESSING phase HA never advances
+  // Pipeline events carry no run id. HA ends a run it replaces (barge-in: our new start cancels
+  // the old run) with a RUN_END sent before the new run's RUN_START, so until RUN_START every
+  // event belongs to the replaced run.
+  bool awaiting_run_start_ = false;  // this dialog's start request has no RUN_START yet
+  bool run_active_ = false;          // some run is between RUN_START and RUN_END
+  bool stale_run_end_ = false;       // the RUN_END of a replaced run is still due
+  bool stop_sent_ = false;           // voice_request_stop already sent for this dialog's run
   std::string tts_url_;
   bool tts_played_ = false;
   bool continue_conversation_ = false;
@@ -125,7 +138,9 @@ class Controller : public ApiHooks {
     uint32_t seconds_left;  // while paused
   };
   std::map<std::string, HaTimer> timers_;  // HA timers by TimerInfo::id
-  uint64_t timer_tick_ = 0;                // clock refresh while a timer is shown
+  std::string shown_timer_;                // id on the clock, "" = none
+  HaTimer shown_{};                        // its data when it was put there
+  uint64_t timer_tick_ = 0;                // looks again when the shown running timer runs out
   // light sensor publishing
   float last_lux_published_ = -1;
   int64_t last_lux_ms_ = 0;

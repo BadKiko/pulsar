@@ -25,10 +25,11 @@ const std::string kSndTimer = std::string(kSounds) + "common/timer.wav";
 constexpr float kDuckGain = 0.15f;
 constexpr int64_t kTimerRingMaxMs = 15 * 60 * 1000;
 // Longest wait for the next pipeline event before the dialog is given up locally. HA's voice
-// command segmenter ends speech capture after at most 15 s of audio; conversation agents (LLMs
-// with tool calls) can think for tens of seconds, streamed ones report INTENT_PROGRESS meanwhile.
+// command segmenter ends speech capture after at most 15 s of audio. Between INTENT_START and
+// INTENT_END nothing arrives (ESPHome forwards INTENT_PROGRESS only once, when TTS streaming
+// starts), and conversation agents (LLMs with tool calls) may think for a minute or more.
 constexpr int64_t kListenTimeoutMs = 30'000;
-constexpr int64_t kProcessTimeoutMs = 60'000;
+constexpr int64_t kProcessTimeoutMs = 120'000;
 constexpr uint16_t kSendspinPort = 8928;
 
 std::string read_line(const char *path) {
@@ -46,14 +47,16 @@ bool Settings::load(const std::string &path) {
   std::ifstream f(path);
   if (!f) return false;
   std::string line;
-  volume_curve = 1;  // files from before the key existed
   while (std::getline(f, line)) {
     auto eq = line.find('=');
     if (eq == std::string::npos) continue;
     std::string k = line.substr(0, eq), v = line.substr(eq + 1);
     float fv = strtof(v.c_str(), nullptr);
-    if (k == "volume") volume = fv;
-    else if (k == "volume_curve") volume_curve = int(fv);
+    if (k == "volume2") {
+      volume = fv;
+      has_volume = true;
+    } else if (k == "volume") volume_legacy = fv;
+    else if (k == "volume_curve") legacy_on_stock = v == "2";
     else if (k == "muted") muted = v == "1";
     else if (k == "mic_muted") mic_muted = v == "1";
     else if (k == "clock_on") clock_on = v == "1";
@@ -78,7 +81,7 @@ void Settings::save(const std::string &path) const {
       LOGW("cannot write %s", tmp.c_str());
       return;
     }
-    f << "volume=" << volume << "\nvolume_curve=" << volume_curve << "\nmuted=" << muted << "\nmic_muted=" << mic_muted
+    f << "volume2=" << volume << "\nvolume=" << volume_legacy << "\nmuted=" << muted << "\nmic_muted=" << mic_muted
       << "\nclock_on=" << clock_on << "\nclock_brightness=" << clock_brightness << "\nlight_on=" << light.on
       << "\nlight_brightness=" << light.brightness << "\nlight_r=" << light.r << "\nlight_g=" << light.g
       << "\nlight_b=" << light.b << "\nlight_effect=" << light.effect << "\nwake_word=" << wake_word
@@ -106,7 +109,7 @@ Controller::~Controller() = default;
 std::string Controller::model_dir(const std::string &id) const { return kModels + id; }
 
 bool Controller::start() {
-  const bool have_state = st_.load(state_path_);
+  st_.load(state_path_);
   if (!st_.tz.empty()) {  // clock shows local time before HA connects
     setenv("TZ", st_.tz.c_str(), 1);
     tzset();
@@ -146,17 +149,17 @@ bool Controller::start() {
                        st_.light.brightness, st_.light.effect);
 
   if (!mixer_.open()) LOGW("mixer unavailable");
-  // First run: keep the volume the speaker already had, but never start loud: on the Lite 2 the
-  // softvol control is at 0 dB (100 %) after boot until the Yandex stack sets it. 0.3 is stock
-  // level 6 of 20 (Alice's "3").
-  if (!have_state) {
-    st_.volume = std::min(mixer_.volume(), 0.3f);
-  } else if (st_.volume_curve < 2) {  // keep the speaker as loud as the saved volume made it
-    const float legacy = st_.volume;
-    st_.volume = mixer_.from_legacy(legacy);
-    st_.volume_curve = 2;
-    LOGI("volume %.3f on the legacy curve -> %.3f on the stock curve", legacy, st_.volume);
+  if (st_.has_volume) {
+    // volume2= is authoritative
+  } else if (st_.volume_legacy >= 0) {  // written by an earlier build: keep the speaker as loud
+    st_.volume = st_.legacy_on_stock ? std::min(1.0f, st_.volume_legacy) : mixer_.from_legacy(st_.volume_legacy);
+    LOGI("volume %.3f from an earlier build -> %.3f", st_.volume_legacy, st_.volume);
     persist();
+  } else {
+    // No volume saved: keep the one the speaker already had, but never start loud: on the Lite 2
+    // the softvol control is at 0 dB (100 %) after boot until the Yandex stack sets it. 0.3 is
+    // stock level 6 of 20 (Alice's "3").
+    st_.volume = std::min(mixer_.volume(), 0.3f);
   }
   mixer_.set_volume(st_.volume);
   mixer_.set_muted(st_.muted);
@@ -172,7 +175,6 @@ bool Controller::start() {
       LOGI("hardware mic mute: %d", m);
       api_->publish_binary_sensor(BinarySensorId::HW_MIC_MUTE, m);
       if (m && phase_ == Phase::LISTENING) {
-        api_->voice_request_stop();
         finish_interaction();
       }
       update_detection();
@@ -185,7 +187,6 @@ bool Controller::start() {
         if (sendspin_pairing_prompt_ && sendspin_) return sendspin_->confirm_pairing_window();
         if (timer_ringing_) return stop_timer_ring();
         if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) {
-          api_->voice_request_stop();
           interrupt_speech();  // an announcement playing over the dialog goes with it
           play_closing_earcon(kSndCancel);
           return finish_interaction();
@@ -227,6 +228,7 @@ bool Controller::start() {
   update_detection();
 
   start_sendspin(id);
+  apply_gains();  // a saved mute
   if (!api_->start()) {
     LOGE("ESPHome API server failed to start");
     return false;
@@ -238,7 +240,10 @@ bool Controller::start() {
   return true;
 }
 
-void Controller::persist() { st_.save(state_path_); }
+void Controller::persist() {
+  st_.volume_legacy = mixer_.to_legacy(st_.volume);
+  st_.save(state_path_);
+}
 
 // ---------------- HA connection ----------------
 
@@ -256,12 +261,22 @@ void Controller::on_client_connected(const std::string &client_info) {
 
 void Controller::on_client_disconnected() {
   LOGW("Home Assistant disconnected");
-  if (phase_ != Phase::IDLE) finish_interaction();
+  voice_link_lost();
 }
 
 void Controller::on_voice_subscribed(bool subscribed) {
   LOGI("voice assistant %s", subscribed ? "subscribed" : "unsubscribed");
-  if (!subscribed && phase_ != Phase::IDLE) finish_interaction();
+  if (!subscribed) voice_link_lost();
+}
+
+// No more events come for the current run, and a stop would reach whichever client subscribes
+// next. A dialog still listening or thinking ends now. An answer already playing is fetched over
+// HTTP independently of the API link, so it plays out (still ducked) and its end closes the
+// dialog; a stream that dies with HA ends it through the player instead.
+void Controller::voice_link_lost() {
+  awaiting_run_start_ = run_active_ = stale_run_end_ = false;
+  continue_conversation_ = false;
+  if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) finish_interaction();
 }
 
 void Controller::on_time(uint32_t epoch, const std::string &tz) {
@@ -298,6 +313,9 @@ void Controller::start_pipeline(const std::string &phrase, bool earcon) {
   LOGI("starting voice pipeline (wake='%s')", phrase.c_str());
   phase_ = Phase::LISTENING;
   dialog_++;
+  stale_run_end_ = run_active_;
+  awaiting_run_start_ = true;
+  stop_sent_ = false;
   listen_started_ms_ = Loop::now_ms();
   loop_.add_timer(kCommandAfterWakeMs + 100, [this] { update_commands(); });
   tts_url_.clear();
@@ -305,7 +323,9 @@ void Controller::start_pipeline(const std::string &phrase, bool earcon) {
   continue_conversation_ = false;
   update_duck();
   if (earcon) player_.play(Channel::ANNOUNCE, {kSndWake});
+  const uint64_t dialog = dialog_;
   api_->voice_request_start(phrase);
+  if (dialog != dialog_) return;  // sending failed and closed the voice client, which ended the dialog
   mic_.set_streaming(true);
   arm_watchdog();
   update_ui();
@@ -323,6 +343,25 @@ void Controller::on_voice_event(VaEvent type, const std::map<std::string, std::s
   };
   // Numbers: VaEvent (1 run-start, 2 run-end, 3/4 stt, 5/6 intent, 7/8 tts, 11/12 vad, 0 error).
   if (type != VaEvent::INTENT_PROGRESS) LOGI("voice event %u", (unsigned)type);
+  if (type == VaEvent::RUN_START) {
+    run_active_ = true;
+    awaiting_run_start_ = false;
+  } else if (awaiting_run_start_) {
+    if (type != VaEvent::RUN_END || stale_run_end_) {
+      if (type == VaEvent::RUN_END) stale_run_end_ = run_active_ = false;
+      LOGD("voice event %u: from the replaced run, ignored", (unsigned)type);
+      return;
+    }
+    // A RUN_END with no run to replace: HA ended our request without running it (it intercepts
+    // the wake word while an automation waits for one).
+    awaiting_run_start_ = false;
+  } else if (type == VaEvent::RUN_END) {
+    run_active_ = false;
+  }
+  if (phase_ == Phase::IDLE) {  // the run of a dialog that already ended; it is being stopped
+    LOGD("voice event %u: dialog already ended, ignored", (unsigned)type);
+    return;
+  }
   switch (type) {
     case VaEvent::RUN_START:
       tts_url_ = get("url");
@@ -336,7 +375,6 @@ void Controller::on_voice_event(VaEvent type, const std::map<std::string, std::s
       break;
     case VaEvent::INTENT_START:
       if (phase_ == Phase::LISTENING) stop_streaming();
-      phase_ = Phase::PROCESSING;
       update_ui();
       break;
     case VaEvent::INTENT_PROGRESS:
@@ -388,10 +426,18 @@ void Controller::tts_finished(bool ok) {
 }
 
 void Controller::finish_interaction() {
+  // The dialog may end before its run does (answer cut short, cancel, timeout): stop the run so
+  // HA does not go on generating; whatever it still sends is dropped while idle.
+  if ((run_active_ || awaiting_run_start_) && !stop_sent_) {
+    api_->voice_request_stop();
+    stop_sent_ = true;
+  }
+  awaiting_run_start_ = false;
   mic_.set_streaming(false);
   phase_ = Phase::IDLE;
   dialog_++;
   tts_played_ = false;
+  tts_url_.clear();
   continue_conversation_ = false;
   update_duck();
   arm_watchdog();
@@ -412,11 +458,15 @@ void Controller::abort_dialog(const char *why) {
 }
 
 void Controller::on_voice_start_failed() {
-  if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) abort_dialog("Home Assistant refused to start it");
+  if (phase_ != Phase::LISTENING && phase_ != Phase::PROCESSING) return;
+  awaiting_run_start_ = false;  // no run follows
+  abort_dialog("Home Assistant refused to start it");
 }
 
-void Controller::on_voice_audio_overflow() {  // the server has already asked HA to stop
-  if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) abort_dialog("network too slow for the microphone audio");
+void Controller::on_voice_audio_overflow() {
+  if (phase_ != Phase::LISTENING && phase_ != Phase::PROCESSING) return;
+  stop_sent_ = true;  // by the server itself
+  abort_dialog("network too slow for the microphone audio");
 }
 
 // Without it a run HA never ends (lost connection state, a hung agent) would leave the ring
@@ -427,7 +477,6 @@ void Controller::arm_watchdog() {
   if (phase_ != Phase::LISTENING && phase_ != Phase::PROCESSING) return;
   watchdog_ = loop_.add_timer(phase_ == Phase::LISTENING ? kListenTimeoutMs : kProcessTimeoutMs, [this] {
     watchdog_ = 0;
-    api_->voice_request_stop();
     abort_dialog("no progress from Home Assistant, giving up");
   });
 }
@@ -515,27 +564,40 @@ void Controller::on_timer_event(const TimerInfo &t) {
 }
 
 // The clock shows the running timer that ends first, else the paused one with the least time
-// left. Clock::set_timer counts down on its own, so a paused value is re-set on every tick.
+// left. The clock counts a running one down by itself, so it is set only when the choice or the
+// timer's data changes, and looked at again when the shown one runs out.
 void Controller::show_timers() {
   const int64_t now = Loop::now_ms();
-  int64_t best = -1;
-  bool best_active = false;
+  const std::string *best_id = nullptr;
+  const HaTimer *best = nullptr;
+  int64_t best_left = 0;
   for (const auto &[id, tm] : timers_) {
     const int64_t left = tm.active ? tm.end_ms - now : int64_t(tm.seconds_left) * 1000;
     if (left <= 0) continue;  // ran out locally; HA's FINISHED follows
-    if (best < 0 || (tm.active && !best_active) || (tm.active == best_active && left < best)) {
-      best = left;
-      best_active = tm.active;
+    if (!best || (tm.active && !best->active) || (tm.active == best->active && left < best_left)) {
+      best_id = &id;
+      best = &tm;
+      best_left = left;
     }
   }
-  if (best < 0) {
-    clock_.set_timer(0);
-    if (timer_tick_) loop_.cancel_timer(timer_tick_);
-    timer_tick_ = 0;
+  if (timer_tick_) loop_.cancel_timer(timer_tick_);
+  timer_tick_ = 0;
+  if (!best) {
+    if (!shown_timer_.empty()) clock_.set_timer(0, true);
+    shown_timer_.clear();
     return;
   }
-  clock_.set_timer(uint32_t((best + 999) / 1000));
-  if (!timer_tick_) timer_tick_ = loop_.add_timer(500, [this] { show_timers(); }, 500);
+  const bool same = *best_id == shown_timer_ && best->active == shown_.active &&
+                    (best->active ? best->end_ms == shown_.end_ms : best->seconds_left == shown_.seconds_left);
+  if (!same) {
+    clock_.set_timer(best_left, best->active);
+    shown_timer_ = *best_id;
+    shown_ = *best;
+  }
+  if (best->active) timer_tick_ = loop_.add_timer(best_left, [this] {
+    timer_tick_ = 0;
+    show_timers();
+  });
 }
 
 // The ring gives the ANNOUNCE channel to speech (TTS answer, HA announcement) and resumes after it.
@@ -577,8 +639,16 @@ void Controller::update_duck() {
   const bool want = phase_ != Phase::IDLE || announcing_ || timer_ringing_ || closing_earcon_;
   if (want == ducked_) return;
   ducked_ = want;
-  player_.set_channel_gain(Channel::MUSIC, want ? kDuckGain : 1.0f);
-  if (sendspin_) sendspin_->set_duck_gain(want ? kDuckGain : 1.0f);
+  apply_gains();
+}
+
+// Mute: softvol raw 0 is the bottom of its dB range (-60 dB on the Midi), still audible, so mute
+// also zeroes the software gains of both playback channels and Sendspin.
+void Controller::apply_gains() {
+  const float music = st_.muted ? 0.0f : ducked_ ? kDuckGain : 1.0f;
+  player_.set_channel_gain(Channel::MUSIC, music);
+  player_.set_channel_gain(Channel::ANNOUNCE, st_.muted ? 0.0f : 1.0f);
+  if (sendspin_) sendspin_->set_duck_gain(music);
 }
 
 void Controller::start_sendspin(const DeviceIdentity &id) {
@@ -620,6 +690,7 @@ void Controller::start_sendspin(const DeviceIdentity &id) {
 void Controller::set_muted(bool m) {
   st_.muted = m;
   mixer_.set_muted(m);
+  apply_gains();
   if (sendspin_) sendspin_->report_volume(st_.volume, st_.muted);
   publish_media();
   persist();
@@ -631,6 +702,7 @@ void Controller::set_volume(float v, bool feedback) {
   if (st_.muted && feedback) {
     st_.muted = false;
     mixer_.set_muted(false);
+    apply_gains();
   }
   if (feedback) {
     leds_.show_volume(st_.volume);
@@ -735,7 +807,6 @@ void Controller::on_switch(SwitchId id, bool state) {
   if (id == SwitchId::MIC_MUTE) {
     st_.mic_muted = state;
     if (state && phase_ == Phase::LISTENING) {
-      api_->voice_request_stop();
       finish_interaction();
     }
     update_detection();
@@ -810,7 +881,6 @@ void Controller::on_command(const std::string &word) {
   bool after_wake = phase_ == Phase::LISTENING && Loop::now_ms() - listen_started_ms_ < kCommandAfterWakeMs;
   LOGI("voice command '%s'%s", word.c_str(), after_wake ? " (after wake word, HA pipeline cancelled)" : "");
   if (after_wake) {
-    api_->voice_request_stop();
     finish_interaction();
   }
   switch (c) {
