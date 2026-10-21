@@ -32,6 +32,8 @@ class Player {
   bool init();  // dlopen + gst_init + static plugin registration + GMainLoop thread
 
   // Plays urls sequentially (http(s)://, file://, or absolute path). Replaces current playback on the channel.
+  // MUSIC retries an http(s) url that fails for network reasons (3 times, 1/2/4 s apart, resuming
+  // at the position reached) before moving on; local files and ANNOUNCE fail at once.
   void play(Channel ch, std::vector<std::string> urls, DoneCb done = nullptr);
   void pause(Channel ch);
   void resume(Channel ch);

@@ -50,13 +50,46 @@ enum : uint32_t {
   MSG_STATE_CHANGED = 1u << 6,
   MSG_CLOCK_LOST = 1u << 10,
 };
-// GstPlayFlags: AUDIO | SOFT_VOLUME (no video/text/visualisation).
+// GstPlayFlags: AUDIO | SOFT_VOLUME (no video/text/visualisation). BUFFERING (1 << 8) is left out
+// on purpose: in this playbin (GStreamer 1.14.5) it only sets uridecodebin "use-buffering", which
+// reaches decodebin for non-stream uris (local files) alone. http(s) uris always get a queue2 with
+// use-buffering=TRUE and adaptive (HLS) ones decodebin buffering regardless, so MSG_BUFFERING
+// already arrives for every network source. Stock maind sets use-buffering because its own
+// souphttpsrc ! decodebin pipelines have no queue2.
 constexpr unsigned kPlayFlags = (1u << 1) | (1u << 4);
+// ANNOUNCE network queue (playbin "buffer-duration" -> queue2 max-size-time, default 2 s). queue2
+// starts out buffering and reports 100 % only once it holds that much input (estimated from the
+// input rate), the whole response, or 2 MB. HA's streamed TTS arrives at about the speaking rate,
+// so the default held each answer back by about 2 s; local files (earcons) have no queue2.
+constexpr int64_t kAnnounceBufferNs = 500'000'000;
+// MUSIC retries of an http(s) uri after a network failure (1, 2, 4 s apart), and the playtime
+// after which a failure counts as a new outage rather than as another retry of the same one.
+constexpr int kMaxRetries = 3;
+constexpr int64_t kRetryResetMs = 60'000;
+// GstResourceError codes souphttpsrc (1.14) posts for connection/TLS failures, unexpected HTTP
+// statuses and transfers broken after its own reconnect attempts (OPEN_READ, READ).
+constexpr int kResourceErrorOpenRead = 5;
+constexpr int kResourceErrorRead = 9;
+constexpr int GST_FORMAT_TIME = 3;
+constexpr int GST_SEEK_FLAG_FLUSH_KEY_UNIT = (1 << 0) | (1 << 2);
 
 inline uint32_t msg_type(gp msg) { return *reinterpret_cast<uint32_t *>(static_cast<char *>(msg) + 64); }
 inline gp msg_src(gp msg) { return *reinterpret_cast<gp *>(static_cast<char *>(msg) + 80); }
 inline const char *gerror_message(gp err) {
   return err ? *reinterpret_cast<const char **>(static_cast<char *>(err) + 8) : "?";
+}
+inline uint32_t gerror_domain(gp err) { return *reinterpret_cast<uint32_t *>(err); }
+inline int gerror_code(gp err) { return *reinterpret_cast<int *>(static_cast<char *>(err) + 4); }
+
+// souphttpsrc (1.14) writes the libsoup status into the error's debug text as
+// "<reason> (<status>), URL: <uri>, Redirect to: ..."; -1 when there is none.
+int soup_status(const char *dbg) {
+  const char *p = dbg ? strstr(dbg, "), URL: ") : nullptr;
+  if (!p) return -1;
+  const char *q = p;
+  while (q > dbg && q[-1] >= '0' && q[-1] <= '9') q--;
+  if (q == p || q == dbg || q[-1] != '(') return -1;
+  return atoi(q);
 }
 
 constexpr const char *kCaBundle = "/etc/ssl/certs/ca-certificates.crt";
@@ -85,6 +118,7 @@ struct Api {
   void (*g_object_set)(gp obj, const char *first, ...);
   void (*g_error_free)(gp err);
   void (*g_free)(gp p);
+  uint32_t (*g_quark_try_string)(const char *s);  // optional, like the two below: retry/resume only
   // gstreamer
   int (*gst_init_check)(int *argc, char ***argv, gp *err);
   gp (*gst_parse_launch)(const char *desc, gp *err);
@@ -96,6 +130,8 @@ struct Api {
   void (*gst_message_parse_buffering)(gp msg, int *percent);
   void (*gst_message_parse_state_changed)(gp msg, int *old_s, int *new_s, int *pending);
   void (*gst_object_unref)(gp obj);
+  int (*gst_element_query_position)(gp el, int format, int64_t *cur);
+  int (*gst_element_seek_simple)(gp el, int format, int flags, int64_t pos);
 };
 
 Api g;  // filled once by load_api()
@@ -132,6 +168,10 @@ bool load_api(void *&glib, void *&gst) {
   ok &= sym(glib, "g_object_set", g.g_object_set);
   ok &= sym(glib, "g_error_free", g.g_error_free);
   ok &= sym(glib, "g_free", g.g_free);
+  g.g_quark_try_string = reinterpret_cast<decltype(g.g_quark_try_string)>(dlsym(glib, "g_quark_try_string"));
+  g.gst_element_query_position =
+      reinterpret_cast<decltype(g.gst_element_query_position)>(dlsym(gst, "gst_element_query_position"));
+  g.gst_element_seek_simple = reinterpret_cast<decltype(g.gst_element_seek_simple)>(dlsym(gst, "gst_element_seek_simple"));
   ok &= sym(gst, "gst_init_check", g.gst_init_check);
   ok &= sym(gst, "gst_parse_launch", g.gst_parse_launch);
   ok &= sym(gst, "gst_element_set_state", g.gst_element_set_state);
@@ -188,6 +228,10 @@ struct Player::Impl {
     bool buffering = false;
     bool reached_playing = false;
     bool all_ok = true;
+    int retries = 0;          // network retries of the current url
+    int64_t started_ms = 0;   // last (re)start of the current url
+    int64_t resume_ns = 0;    // position to seek to once a retried url has prerolled
+    unsigned retry_src = 0;   // GLib timeout of a pending retry
     double gain_cur = 1.0, gain_target = 1.0;
     unsigned ramp_src = 0;
     std::atomic<PlayState> state{PlayState::IDLE};
@@ -268,7 +312,13 @@ struct Player::Impl {
     });
   }
 
+  void cancel_retry(Chan &c) {
+    if (c.retry_src) g.g_source_remove(c.retry_src);
+    c.retry_src = 0;
+  }
+
   void halt(Chan &c, bool failed) {
+    cancel_retry(c);
     g.gst_element_set_state(c.pipe, GST_STATE_NULL);
     c.active = false;
     c.buffering = false;
@@ -282,6 +332,9 @@ struct Player::Impl {
     complete(c.id, c.item_gen, ok_);
   }
 
+  // Every (re)start passes through NULL: GstPipeline's auto-flush-bus (on by default) drops all
+  // queued bus messages on READY -> NULL, so an EOS/ERROR still pending from the previous uri
+  // cannot end this one.
   void start_current(Chan &c) {
     std::string uri = to_uri(c.urls[c.index]);
     LOGI("player: ch%d play [%zu/%zu] %s", int(c.id), c.index + 1, c.urls.size(), uri.c_str());
@@ -289,6 +342,7 @@ struct Player::Impl {
     g.g_object_set(c.pipe, "uri", uri.c_str(), nullptr);
     c.buffering = false;
     c.reached_playing = false;
+    c.started_ms = Loop::now_ms();
     set_state(c, c.want_play ? PlayState::LOADING : PlayState::PAUSED);
     if (g.gst_element_set_state(c.pipe, c.want_play ? GST_STATE_PLAYING : GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE) {
       LOGE("player: ch%d set_state failed for %s", int(c.id), uri.c_str());
@@ -299,6 +353,8 @@ struct Player::Impl {
   // Current url finished (ok) or failed; go to the next or finish the list.
   void advance(Chan &c, bool ok_) {
     c.all_ok = c.all_ok && ok_;
+    c.retries = 0;
+    c.resume_ns = 0;
     if (c.index + 1 < c.urls.size()) {
       c.index++;
       start_current(c);
@@ -307,8 +363,52 @@ struct Player::Impl {
     }
   }
 
+  // MUSIC http(s) streams only: the network may come back, a local file or a TTS answer will not
+  // (and a late answer is worse than none).
+  bool retryable(const Chan &c, gp err, const char *dbg) const {
+    if (c.id != Channel::MUSIC || !err) return false;
+    const std::string &u = c.urls[c.index];
+    if (u.rfind("http://", 0) != 0 && u.rfind("https://", 0) != 0) return false;
+    // Transport failures (libsoup status < 100: DNS, connect, TLS, broken transfer), 5xx, 408 and
+    // 429 may pass; other HTTP statuses (404, 403, ...) will not.
+    const int status = soup_status(dbg);
+    if (status >= 0) return status < 100 || status >= 500 || status == 408 || status == 429;
+    const uint32_t resource = g.g_quark_try_string ? g.g_quark_try_string("gst-resource-error-quark") : 0;
+    const int code = gerror_code(err);
+    return resource && gerror_domain(err) == resource && (code == kResourceErrorOpenRead || code == kResourceErrorRead);
+  }
+
+  // Restarts the current uri after a backoff, resuming at the position reached (live streams
+  // refuse the seek and simply restart); false when the retries are used up.
+  bool schedule_retry(Chan &c) {
+    if (Loop::now_ms() - c.started_ms >= kRetryResetMs) c.retries = 0;
+    if (c.retries >= kMaxRetries) return false;
+    const unsigned delay = 1000u << c.retries++;
+    LOGW("player: ch%d network failure, retry %d/%d in %u ms", int(c.id), c.retries, kMaxRetries, delay);
+    int64_t pos = 0;
+    if (g.gst_element_query_position && g.gst_element_query_position(c.pipe, GST_FORMAT_TIME, &pos) && pos > 0)
+      c.resume_ns = pos;
+    g.gst_element_set_state(c.pipe, GST_STATE_NULL);
+    c.buffering = false;
+    c.reached_playing = false;
+    set_state(c, c.want_play ? PlayState::LOADING : PlayState::PAUSED);
+    c.retry_src = g.g_timeout_add(delay, &Impl::retry_tick, &c);
+    return true;
+  }
+
+  static int retry_tick(gp user) {
+    auto &c = *static_cast<Chan *>(user);
+    c.retry_src = 0;
+    if (c.active) c.impl->start_current(c);
+    return 0;  // G_SOURCE_REMOVE
+  }
+
   void apply_target_state(Chan &c) {
     if (!c.active) return;
+    if (c.retry_src) {  // waiting to retry: the pipeline stays in NULL until retry_tick
+      set_state(c, c.want_play ? PlayState::LOADING : PlayState::PAUSED);
+      return;
+    }
     int st = (c.want_play && !c.buffering) ? GST_STATE_PLAYING : GST_STATE_PAUSED;
     g.gst_element_set_state(c.pipe, st);
     if (!c.want_play)
@@ -336,9 +436,10 @@ struct Player::Impl {
         char *dbg = nullptr;
         g.gst_message_parse_error(msg, &err, &dbg);
         LOGE("player: ch%d error: %s (%s)", int(c.id), gerror_message(err), dbg ? dbg : "");
+        const bool retry = retryable(c, err, dbg);
         if (err) g.g_error_free(err);
         if (dbg) g.g_free(dbg);
-        advance(c, false);
+        if (!retry || !schedule_retry(c)) advance(c, false);
         break;
       }
       case MSG_WARNING: {
@@ -365,6 +466,12 @@ struct Player::Impl {
         if (msg_src(msg) != c.pipe) break;
         int o = 0, n = 0, p = 0;
         g.gst_message_parse_state_changed(msg, &o, &n, &p);
+        if (c.resume_ns > 0 && n >= GST_STATE_PAUSED && g.gst_element_seek_simple) {
+          const int64_t pos = c.resume_ns;
+          c.resume_ns = 0;
+          const bool sought = g.gst_element_seek_simple(c.pipe, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH_KEY_UNIT, pos);
+          LOGI("player: ch%d %s at %lld ms", int(c.id), sought ? "resumed" : "cannot seek, restarted", (long long)(pos / 1000000));
+        }
         if (n == GST_STATE_PLAYING) {
           c.reached_playing = true;
           if (c.want_play && !c.buffering) set_state(c, PlayState::PLAYING);
@@ -402,6 +509,7 @@ struct Player::Impl {
     g.g_main_loop_run(mainloop);
     for (auto &c : chans) {
       if (c.ramp_src) g.g_source_remove(c.ramp_src);
+      cancel_retry(c);
       g.gst_element_set_state(c.pipe, GST_STATE_NULL);
       g.gst_object_unref(c.pipe);
       c.pipe = nullptr;
@@ -468,6 +576,7 @@ bool Player::init() {
     }
     g.g_object_set(c.pipe, "flags", kPlayFlags, nullptr);
     g.g_object_set(c.pipe, "volume", 1.0, nullptr);
+    if (c.id == Channel::ANNOUNCE) g.g_object_set(c.pipe, "buffer-duration", kAnnounceBufferNs, nullptr);
     gp bus = g.gst_pipeline_get_bus(c.pipe);
     g.gst_bus_add_watch(bus, &Impl::on_bus, &c);
     g.gst_object_unref(bus);
@@ -489,12 +598,15 @@ void Player::play(Channel ch, std::vector<std::string> urls, DoneCb done) {
       d->complete(ch, gen, false);
       return;
     }
+    d->cancel_retry(c);
     c.urls = std::move(urls);
     c.index = 0;
     c.item_gen = gen;
     c.active = true;
     c.want_play = true;
     c.all_ok = true;
+    c.retries = 0;
+    c.resume_ns = 0;
     d->start_current(c);
   });
 }
