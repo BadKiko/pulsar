@@ -1,5 +1,7 @@
-// 4-digit 7-segment clock of the Station Midi (two aw21036/aw21012 chips on i2c 3-0037 / 3-0021,
-// one sysfs LED per segment: /sys/class/leds/cucumber:white:clock-<seg><digit>).
+// 4-digit 7-segment clock, one sysfs LED per segment (names per Model).
+//
+// Station Midi: two aw21036/aw21012 chips on i2c 3-0037 / 3-0021,
+// /sys/class/leds/cucumber:white:clock-<seg><digit>.
 //
 // Segment mapping (derived from the live display driven by maind: at 21:17 local time the lit
 // set was a1 b1 d1 e1 g1 | b2 c2 | b3 c3 | a4 b4 c4 plus p3 q3, i.e. "21:17"):
@@ -15,10 +17,14 @@
 //   deg         degree sign; h1 h2, l1 l2, m1 m2, p1 p2 p4 p5, q1 q2 q4 q5: auxiliary dots/icons
 //               whose position is not known (never lit by maind for the time); kept off here.
 //   cucumber:sync:clock-0/1 are the chips' sync pseudo-LEDs (not segments).
+// Midi brightness: like maind, segments are switched 0/255 and dimming uses the chips' global
+// current attribute (/sys/bus/i2c/devices/{3-0037,3-0021}/current, 0..255; maind wrote 5 for its
+// stored brightness 0.0196 = 5/255). The brightness_scale tables are left untouched.
 //
-// Brightness: like maind, segments are switched 0/255 and dimming uses the chips' global current
-// attribute (/sys/bus/i2c/devices/{3-0037,3-0021}/current, 0..255; maind wrote 5 for its stored
-// brightness 0.0196 = 5/255). The brightness_scale tables are left untouched.
+// Station Lite 2: /sys/class/leds/plum:white:clock<SEG><pos>, SEG = A..G (standard segments),
+// pos = 0..3 left to right, colon = DH + DL; H0..H3, DM and DEGREE stay dark (maind's
+// /leds/clock frameBuilder config in quasar.cfg). No global current: maind dims through the
+// per-segment brightness value (0..255), and so do we.
 //
 // Time is local time via localtime_r, i.e. it honours the process TZ (the device has no
 // /etc/localtime or zoneinfo, so the daemon must setenv("TZ", "<POSIX TZ>") + tzset(), e.g. from
@@ -41,13 +47,12 @@ namespace cs {
 
 namespace {
 
-constexpr const char *kLedDir = "/sys/class/leds/cucumber:white:clock-";
 constexpr int kDigits = 4;
 constexpr int kSegs = 7;  // a..g
 constexpr int64_t kTickMs = 250;
 constexpr int64_t kFlashMs = 1500;
 constexpr int64_t kCodePageMs = 2000;
-constexpr int kMinCurrent = 2;  // lowest global current that still lights the segments
+constexpr int kMinLevel = 2;  // lowest current / brightness that still lights the segments
 
 // Bit i = segment 'a'+i.
 constexpr uint8_t kFont[10] = {
@@ -64,22 +69,21 @@ constexpr uint8_t kFont[10] = {
 };
 constexpr uint8_t kMinus = 0x40;  // g
 
-// Auxiliary LEDs we own but keep dark.
-const char *const kAux[] = {"deg", "h1", "h2", "l1", "l2", "m1", "m2", "p1", "p2", "p4", "p5", "q1", "q2", "q4", "q5"};
-
 }  // namespace
 
 struct Clock::Impl {
-  explicit Impl(Loop &l) : loop(l) {}
+  Impl(Loop &l, const Model &m) : loop(l), model(m) {}
   Loop &loop;
+  const Model &model;
 
   int seg_fd[kDigits][kSegs];
-  int colon_fd[2] = {-1, -1};
+  std::vector<int> colon_fd;
   std::vector<int> current_fds;
   // last written state (-1 = unknown)
   int seg_last[kDigits][kSegs];
   int colon_last = -1;
-  int current_last = -1;
+  int level_last = -1;
+  int on_value = 255;  // value of a lit segment (dimmed level when there is no chip current)
 
   bool enabled = true;
   float user_bri = 1.f;
@@ -103,33 +107,47 @@ struct Clock::Impl {
     for (int fd : current_fds) close(fd);
   }
 
-  static int open_led(const std::string &name) {
-    return ::open((std::string(kLedDir) + name + "/brightness").c_str(), O_WRONLY | O_CLOEXEC);
+  int open_led(const std::string &name) const {
+    return ::open((model.clock_dir + name + "/brightness").c_str(), O_WRONLY | O_CLOEXEC);
+  }
+
+  std::string seg_name(int digit, int seg) const {
+    return std::string(1, char(model.clock_seg_base + seg)) + std::to_string(model.clock_pos_base + digit);
+  }
+
+  void forget_written() {
+    for (auto &d : seg_last)
+      for (int &v : d) v = -1;
+    colon_last = -1;
   }
 
   void set_seg(int d, int s, bool on) {
-    int v = on ? 255 : 0;
+    int v = on ? on_value : 0;
     if (seg_last[d][s] == v || seg_fd[d][s] < 0) return;
     if (hwutil::write_int_fd(seg_fd[d][s], v)) seg_last[d][s] = v;
   }
 
   void set_colon(bool on) {
-    int v = on ? 255 : 0;
+    int v = on ? on_value : 0;
     if (colon_last == v) return;
-    for (int fd : colon_fd)
-      if (fd >= 0) hwutil::write_int_fd(fd, v);
+    for (int fd : colon_fd) hwutil::write_int_fd(fd, v);
     colon_last = v;
   }
 
   float ambient() const { return dimmer.factor(); }  // 0.02..1, 1 while lux is unknown
 
-  void apply_current() {
-    int cur = int(std::lround(255.f * user_bri * ambient()));
-    cur = user_bri <= 0 ? 0 : std::max(kMinCurrent, std::min(255, cur));
-    if (cur == current_last) return;
-    for (int fd : current_fds) hwutil::write_int_fd(fd, cur);
-    current_last = cur;
-    LOGD("clock: current=%d (user %.2f, lux %.1f)", cur, user_bri, lux);
+  void apply_level() {
+    int lvl = int(std::lround(255.f * user_bri * ambient()));
+    lvl = user_bri <= 0 ? 0 : std::max(kMinLevel, std::min(255, lvl));
+    if (lvl == level_last) return;
+    level_last = lvl;
+    LOGD("clock: level=%d (user %.2f, lux %.1f)", lvl, user_bri, lux);
+    if (model.clock_chip_current) {
+      for (int fd : current_fds) hwutil::write_int_fd(fd, lvl);
+    } else {
+      on_value = lvl;  // lit segments are rewritten with the new value on the next refresh
+      forget_written();
+    }
   }
 
   void show(const uint8_t glyph[kDigits], bool colon, bool force = false) {
@@ -169,11 +187,7 @@ struct Clock::Impl {
   void refresh() {
     int64_t now = Loop::now_ms();
     // Every ~5 s rewrite all segments even if unchanged (sysfs state may be changed by others).
-    if (++refreshes % 20 == 0) {
-      for (auto &d : seg_last)
-        for (int &v : d) v = -1;
-      colon_last = -1;
-    }
+    if (++refreshes % 20 == 0) forget_written();
     if (!code.empty()) return show_code(now);
     uint8_t g[kDigits] = {0, 0, 0, 0};
     bool colon = false;
@@ -211,7 +225,7 @@ struct Clock::Impl {
   }
 };
 
-Clock::Clock(Loop &loop) : impl_(new Impl(loop)) {
+Clock::Clock(Loop &loop, const Model &model) : impl_(new Impl(loop, model)) {
   for (auto &d : impl_->seg_fd)
     for (int &fd : d) fd = -1;
   for (auto &d : impl_->seg_last)
@@ -225,43 +239,48 @@ bool Clock::open() {
   int found = 0;
   for (int dig = 0; dig < kDigits; dig++)
     for (int s = 0; s < kSegs; s++) {
-      char name[8];
-      snprintf(name, sizeof name, "%c%d", 'a' + s, dig + 1);
-      d.seg_fd[dig][s] = Impl::open_led(name);
+      std::string name = d.seg_name(dig, s);
+      d.seg_fd[dig][s] = d.open_led(name);
       if (d.seg_fd[dig][s] >= 0) found++;
-      else LOGW("clock: missing segment %s", name);
+      else LOGW("clock: missing segment %s", name.c_str());
     }
   if (!found) {
     LOGE("clock: no clock segments found");
     return false;
   }
-  d.colon_fd[0] = Impl::open_led("p3");
-  d.colon_fd[1] = Impl::open_led("q3");
-  for (const char *aux : kAux) {
-    int fd = Impl::open_led(aux);
+  for (const auto &name : d.model.clock_colon) {
+    int fd = d.open_led(name);
+    if (fd >= 0) d.colon_fd.push_back(fd);
+  }
+  for (const auto &aux : d.model.clock_aux) {
+    int fd = d.open_led(aux);
     if (fd >= 0) {
       hwutil::write_int_fd(fd, 0);
       close(fd);
     }
   }
-  // Global current of both clock driver chips, found through the LED device links.
-  for (const char *seg : {"a1", "a4"}) {
-    std::string dev = std::string(kLedDir) + seg + "/device/current";
-    char real[256];
-    if (!realpath(dev.c_str(), real)) continue;
-    bool dup = false;
-    for (int fd : d.current_fds) {
-      char p[64], r2[256];
-      snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
-      ssize_t n = readlink(p, r2, sizeof r2 - 1);
-      if (n > 0 && std::string(r2, size_t(n)) == real) dup = true;
+  if (d.model.clock_chip_current) {
+    // Global current of the clock driver chips, found through the LED device links of the
+    // leftmost and rightmost digit (one chip each on the Midi).
+    for (const std::string &seg : {d.seg_name(0, 0), d.seg_name(kDigits - 1, 0)}) {
+      std::string dev = d.model.clock_dir + seg + "/device/current";
+      char real[256];
+      if (!realpath(dev.c_str(), real)) continue;
+      bool dup = false;
+      for (int fd : d.current_fds) {
+        char p[64], r2[256];
+        snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(p, r2, sizeof r2 - 1);
+        if (n > 0 && std::string(r2, size_t(n)) == real) dup = true;
+      }
+      if (dup) continue;
+      int fd = ::open(real, O_WRONLY | O_CLOEXEC);
+      if (fd >= 0) d.current_fds.push_back(fd);
     }
-    if (dup) continue;
-    int fd = ::open(real, O_WRONLY | O_CLOEXEC);
-    if (fd >= 0) d.current_fds.push_back(fd);
   }
-  LOGI("clock: %d segments, %zu driver chips", found, d.current_fds.size());
-  d.apply_current();
+  LOGI("clock: %d segments, %zu colon LEDs, %s dimming", found, d.colon_fd.size(),
+       d.model.clock_chip_current ? "chip current" : "segment brightness");
+  d.apply_level();
   d.refresh();
   d.tick = d.loop.add_timer(kTickMs, [&d] { d.refresh(); }, kTickMs);
   return true;
@@ -274,13 +293,15 @@ void Clock::set_enabled(bool on) {
 
 void Clock::set_brightness(float b) {
   impl_->user_bri = std::max(0.f, std::min(1.f, b));
-  impl_->apply_current();
+  impl_->apply_level();
+  impl_->refresh();
 }
 
 void Clock::set_ambient_lux(float lux) {
   impl_->lux = std::max(0.f, lux);
   impl_->dimmer.update(impl_->lux);
-  impl_->apply_current();
+  impl_->apply_level();
+  impl_->refresh();
 }
 
 void Clock::set_timer(uint32_t seconds_left) {

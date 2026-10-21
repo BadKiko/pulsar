@@ -1,4 +1,4 @@
-// cucumber-satellite: Home Assistant voice satellite for Yandex Station Midi.
+// cucumber-satellite: Home Assistant voice satellite for Yandex Stations (Midi, Lite 2).
 // usage: cucumber-satellite [--version | state_file]
 #include <execinfo.h>
 #include <signal.h>
@@ -122,6 +122,8 @@ int main(int argc, char **argv) {
   const char *state = argc > 1 ? argv[1] : "/data/cucumber-satellite/state.conf";
   signal(SIGPIPE, SIG_IGN);
   install_crash_handler();
+  const cs::Model *model = cs::detect_model();
+  if (!model) return 1;
 
   cs::Loop loop;
   sigset_t mask;
@@ -138,12 +140,13 @@ int main(int argc, char **argv) {
     }
   });
 
-  cs::Controller ctl(loop, state);
+  cs::Controller ctl(loop, *model, state);
   if (!ctl.start()) {
     arm_teardown_watchdog(1);
     return 1;
   }
-  LOGI("cucumber-satellite %s running", CS_VERSION);
+  LOGI("cucumber-satellite %s running on %s (%s)", CS_VERSION, model->model_name.c_str(),
+       model->codename.c_str());
   loop.run();
   arm_teardown_watchdog(0);
   return 0;  // ~Controller runs here, under the watchdog

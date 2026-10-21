@@ -1,0 +1,60 @@
+// Per-model hardware description of the supported Yandex Stations. The model is detected once
+// from the devicetree ("yandex,<codename>" in /proc/device-tree/compatible).
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace cs {
+
+struct Model {
+  std::string codename;       // devicetree codename: "cucumber", "plum"
+  std::string host_prefix;    // ESPHome node name prefix, the MAC suffix is appended
+  std::string friendly_name;  // shown in Home Assistant / Music Assistant
+  std::string model_name;
+
+  // Capture: interleaved S16 frames from capture_pcm; VQE gets mic_channels / spk_channels.
+  std::string capture_pcm;
+  unsigned capture_rate = 0, capture_channels = 0;
+  std::vector<unsigned> mic_channels, spk_channels;
+  std::string vqe_preset;
+
+  // LED ring (+ optional logo), each an Nx1 BGR framebuffer behind an ledfb trigger, with
+  // per-channel sysfs LEDs "<led_prefix>:<color>:<ring|logo><index>" as fallback.
+  struct LedStrip {
+    int count = 0;
+    int first_index = 0;      // sysfs numbering starts at 0 (Midi) or 1 (Lite 2)
+    std::string fb_dev;       // "/dev/fb0"
+    std::string fb_name;      // expected /sys/class/graphics/fbN/name
+    std::string trigger;      // LED trigger that routes the framebuffer to the LEDs
+    std::string sysfs_kind;   // "ring" / "logo"
+  };
+  std::string led_prefix;
+  LedStrip ring, logo;        // logo.count == 0: no logo
+
+  // 4-digit 7-segment clock: "<clock_dir><segment><position>" sysfs LEDs.
+  std::string clock_dir;      // e.g. "/sys/class/leds/cucumber:white:clock-"
+  char clock_seg_base = 'a';  // name of segment a ('a' or 'A')
+  int clock_pos_base = 1;     // name of the leftmost digit position
+  std::vector<std::string> clock_colon, clock_aux;  // colon LEDs; LEDs kept dark
+  // true: segments switch 0/255, dimming via the driver chips' "current" attribute;
+  // false: dimming via the per-segment brightness value itself.
+  bool clock_chip_current = true;
+
+  std::string keys_input, mute_input;  // evdev device names
+  std::string error_sound;             // relative to /system/vendor/quasar/sounds/
+
+  // Default Sendspin output delay: the firmware's multiroom hint, not an acoustic measurement
+  // (quasar.cfg "multiroomd": {"latency_ms": -N}, i.e. Yandex's multiroom daemon plays N ms early).
+  // snd_pcm_delay() already covers our ring, plug and dmix; this is the hardware path behind it
+  // (TDM FIFO, AED, amplifier). sendspin-cpp schedules a chunk at client_time(server_ts) -
+  // output_delay_ms - fixed_delay_us, so a positive value plays earlier. Used only while no
+  // output_delay blob is persisted, i.e. until Music Assistant/the user sets the delay once.
+  uint16_t sendspin_output_delay_ms = 0;
+};
+
+// The detected model; nullptr on unsupported hardware.
+const Model *detect_model();
+
+}  // namespace cs

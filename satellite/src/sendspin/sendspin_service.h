@@ -25,6 +25,8 @@ struct SendspinConfig {
   std::string mac;        // "aa:bb:cc:dd:ee:ff"
   std::string state_dir;  // identity/pairing persistence directory
   uint16_t port = 8928;
+  // Used until Music Assistant/the user sets the output delay once (positive plays earlier).
+  uint16_t initial_output_delay_ms = 0;
 };
 
 class SendspinService {

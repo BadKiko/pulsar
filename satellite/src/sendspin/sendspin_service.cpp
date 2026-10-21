@@ -35,20 +35,6 @@ constexpr float kGainRampSec = 0.08f;      // full-scale duck ramp duration
 constexpr int64_t kStatsPeriodUs = 10000000;
 constexpr int64_t kReopenRetryUs = 1000000;
 
-// Default Sendspin output delay for models whose firmware hints at a static output latency. This is
-// the firmware's multiroom hint, not an acoustic measurement: Midi quasar.cfg has
-// "multiroomd": {"latency_ms": -22} (Yandex's multiroom daemon plays 22 ms early); the Lite 2
-// (plum) config has latency_ms 0, so no default there. snd_pcm_delay() already covers our ring,
-// plug and dmix; this is the hardware path behind it (TDM FIFO, AED, amplifier).
-// sendspin-cpp schedules a chunk at client_time(server_ts) - output_delay_ms - fixed_delay_us, so a
-// positive value plays earlier. initial_output_delay_ms is used only while no output_delay blob
-// is persisted in state_dir, i.e. until Music Assistant/the user sets the delay once.
-uint16_t default_output_delay_ms() {
-  std::ifstream f("/proc/device-tree/compatible", std::ios::binary);
-  std::string compat((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-  return compat.find("yandex,cucumber") != std::string::npos ? 22 : 0;
-}
-
 std::string hex_tail(const std::string &s, size_t n) { return s.size() > n ? s.substr(0, n) + "…" : s; }
 
 const char *abort_reason(ss::SendspinPairAbortReason r) {
@@ -613,7 +599,7 @@ bool SendspinService::start(float volume, bool muted) {
   if (!d.persistence.ensure_dir()) LOGW("sendspin: identity will not persist");
 
   ss::PlayerRoleConfig pc;
-  pc.initial_output_delay_ms = default_output_delay_ms();
+  pc.initial_output_delay_ms = d.cfg.initial_output_delay_ms;
   pc.audio_formats = {
       {ss::SendspinCodecFormat::FLAC, 2, 48000, 16},
       {ss::SendspinCodecFormat::FLAC, 2, 44100, 16},

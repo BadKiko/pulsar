@@ -22,7 +22,6 @@ constexpr const char *kSounds = "/system/vendor/quasar/sounds/";
 const std::string kSndWake = std::string(kSounds) + "common/spotter_start.mp3";
 const std::string kSndCancel = std::string(kSounds) + "common/spotter_cancel.mp3";
 const std::string kSndTimer = std::string(kSounds) + "common/timer.wav";
-const std::string kSndError = std::string(kSounds) + "ru-RU/vins_error.wav";
 constexpr float kDuckGain = 0.15f;
 constexpr int64_t kTimerRingMaxMs = 15 * 60 * 1000;
 constexpr uint16_t kSendspinPort = 8928;
@@ -83,14 +82,15 @@ void Settings::save(const std::string &path) const {
 
 // ---------------- Controller ----------------
 
-Controller::Controller(Loop &loop, const std::string &state_path)
+Controller::Controller(Loop &loop, const Model &model, const std::string &state_path)
     : loop_(loop),
+      model_(model),
       state_path_(state_path),
-      mic_(loop),
+      mic_(loop, model),
       player_(loop),
-      leds_(loop),
-      clock_(loop),
-      input_(loop),
+      leds_(loop, model),
+      clock_(loop, model),
+      input_(loop, model),
       light_(loop) {}
 
 Controller::~Controller() = default;
@@ -111,10 +111,11 @@ bool Controller::start() {
   for (char c : mac)
     if (c != ':') suffix += tolower(c);
   suffix = suffix.size() >= 6 ? suffix.substr(suffix.size() - 6) : suffix;
-  id.name = "yandex-midi-" + suffix;
-  id.friendly_name = "Яндекс Станция Миди";
+  id.name = model_.host_prefix + suffix;
+  id.friendly_name = model_.friendly_name;
   id.mac = mac;
-  id.model = "Yandex Station Midi";
+  id.model = model_.model_name;
+  id.board = model_.codename;
   id.manufacturer = "Yandex";
   id.project_version = CS_VERSION;
 
@@ -137,7 +138,9 @@ bool Controller::start() {
                        st_.light.brightness, st_.light.effect);
 
   if (!mixer_.open()) LOGW("mixer unavailable");
-  if (!have_state) st_.volume = mixer_.volume();  // first run: keep the volume the speaker already had
+  // First run: keep the volume the speaker already had, but never start loud: on the Lite 2 the
+  // softvol control is at 0 dB (100 %) after boot until the Yandex stack sets it.
+  if (!have_state) st_.volume = std::min(mixer_.volume(), 0.3f);
   mixer_.set_volume(st_.volume);
   mixer_.set_muted(st_.muted);
   if (!player_.init()) LOGE("player init failed");
@@ -332,7 +335,7 @@ void Controller::on_voice_event(VaEvent type, const std::map<std::string, std::s
       stop_streaming();
       error_shown_ = true;
       leds_.set_ui_state(UiState::ERROR);
-      if (get("code") != "stt-no-text-recognized") play_closing_earcon(kSndError);
+      if (get("code") != "stt-no-text-recognized") play_closing_earcon(kSounds + model_.error_sound);
       break;
     case VaEvent::RUN_END:
       stop_streaming();
@@ -538,6 +541,7 @@ void Controller::start_sendspin(const DeviceIdentity &id) {
   auto slash = state_path_.rfind('/');
   cfg.state_dir = (slash == std::string::npos ? std::string(".") : state_path_.substr(0, slash)) + "/sendspin";
   cfg.port = kSendspinPort;
+  cfg.initial_output_delay_ms = model_.sendspin_output_delay_ms;
 
   SendspinService::Hooks h;
   h.on_stream = [this](bool active) {

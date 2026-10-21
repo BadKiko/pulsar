@@ -4,11 +4,12 @@ Guide for coding agents working on cucumber-satellite. User-facing docs: `README
 
 ## What this is
 
-A native C++ daemon replacing the Yandex stack (`maind` / `quasar_launcher2`) on a rooted Yandex
-Station Midi (`cucumber`: Buildroot, glibc 2.36, Cortex-A55, 1 GB RAM). It exposes the speaker to
-Home Assistant over the ESPHome Native API (plaintext, port 6053) and to Music Assistant as a
-Sendspin player (port 8928). Wake word, command spotting and echo cancellation use the firmware's
-own proprietary libraries, loaded with `dlopen` at runtime; they are never copied into the repo.
+A native C++ daemon replacing the Yandex stack (`maind` / `quasar_launcher2`) on rooted Yandex
+Stations: Midi (`cucumber`: aarch64, glibc 2.36, 1 GB RAM) and Lite 2 (`plum`: 32-bit armhf,
+glibc 2.30, 237 MB RAM). It exposes the speaker to Home Assistant over the ESPHome Native API
+(plaintext, port 6053) and to Music Assistant as a Sendspin player (port 8928). Wake word, command
+spotting and echo cancellation use the firmware's own proprietary libraries, loaded with `dlopen`
+at runtime; they are never copied into the repo.
 
 ## Layout
 
@@ -16,10 +17,11 @@ own proprietary libraries, loaded with `dlopen` at runtime; they are never copie
 |---|---|
 | `satellite/src/core/` | epoll event loop (`Loop`: fds, timers, cross-thread `post`), logging |
 | `satellite/src/esphome/` | ESPHome API server (hand-written protobuf in `proto.h`), mDNS responder |
-| `satellite/src/audio/frontend.*` | capture thread: ALSA `hw:0,2` → Yandex VQE → wake + command spotters → 16 kHz stream |
+| `satellite/src/model.*` | per-model hardware description (capture layout, VQE preset, LEDs, clock, inputs, sounds), detected from `/proc/device-tree/compatible` |
+| `satellite/src/audio/frontend.*` | capture thread (ALSA → FIFO) + processing thread: Yandex VQE → wake + command spotters → 16 kHz stream |
 | `satellite/src/media/player.*` | playback through the firmware's GStreamer (`libquasar_gstreamer.so`), channels MUSIC / ANNOUNCE; `Mixer` = ALSA "Master Playback Volume" (softvol of the `speakers` PCM) |
 | `satellite/src/sendspin/` | Sendspin player on top of sendspin-cpp, own ALSA sink on the `speakers` dmix |
-| `satellite/src/hw/` | LED ring / logo (`/dev/fb0`, `/dev/fb1`), clock (sysfs segments), input (`awinic_sar` keys, `SW_MUTE_DEVICE`), light sensor (`ltr308als01`) |
+| `satellite/src/hw/` | LED ring / logo (framebuffers behind ledfb triggers), clock (sysfs segments), input (touch keys, `SW_MUTE_DEVICE`), light sensor (`ltr308als01`) |
 | `satellite/src/controller.*` | all satellite logic: voice pipeline state machine, entities, local commands, persistence |
 | `satellite/deploy/` | `install.sh` (host side); `boot.sh`, `supervise.sh`, `ctl.sh` (device side) |
 | `satellite/tools/` | probes: `hw_probe`, `player_probe`, `ww_offline` (offline spotter test on a WAV), `api_selftest` |
@@ -32,14 +34,19 @@ logs), `re/` (Ghidra projects and decompiled Yandex code), `ref/` (upstream chec
 ## Build
 
 ```sh
-make -C satellite -j"$(nproc)"            # → satellite/build/cucumber-satellite
-make -C satellite build/tools/ww_offline   # any tool in satellite/tools/
-ssh/build.sh                               # → ssh/out/{dropbearmulti,sftp-server}
+make -C satellite -j"$(nproc)"                       # both: build/{aarch64,armhf}/cucumber-satellite
+make -C satellite ARCH=armhf                          # one architecture
+make -C satellite ARCH=armhf build/armhf/tools/ww_offline   # any tool in satellite/tools/
+ssh/build.sh                                         # → ssh/out/{aarch64,armhf}/{dropbearmulti,sftp-server}
 ```
 
-Host tools: zig 0.13, make, git, curl, cmake ≥ 3.16, ninja, patch. The first build fetches pinned
-dependencies into `satellite/third_party/src/` and builds the ALSA sysroot into
-`satellite/build/sysroot/`. There is no host test suite; verification happens on the device.
+Host tools: **zig 0.14.1** (`ZIG=/path/to/zig` if not in PATH; the Makefile rejects ≤ 0.13, whose
+armhf C++ release builds crash before `main`), make, git, curl, cmake ≥ 3.16, ninja, patch. The
+first build fetches pinned dependencies into `satellite/third_party/src/` and builds an ALSA
+sysroot per architecture into `satellite/build/<arch>/sysroot/` (Midi: versioned like the
+firmware's alsa-lib; Lite 2: unversioned, exporting only `snd_*`, otherwise the daemon would import
+zig's compiler-rt helpers from libasound). Binaries are stripped (~1.7 MB). There is no host test
+suite; verification happens on the device.
 
 ## Deploy
 
@@ -48,15 +55,15 @@ satellite/deploy/install.sh --list         # discover stations (mDNS; --scan = a
 satellite/deploy/install.sh <ip>[:port]    # build if needed, copy binary (+ .prev), add boot hook, restart
 ```
 
-Models are identified by `/proc/device-tree/compatible` (`yandex,<codename>`). Only codenames in
-`SUPPORTED` in `install.sh` are installed (currently `cucumber` = Midi); others, e.g. `plum` =
-Lite 2, are listed and skipped. Porting a model means a hardware study first (ALSA capture layout,
-VQE preset name, spotter models, LEDs, inputs), then runtime model selection in the daemon.
+Models are identified by `/proc/device-tree/compatible` (`yandex,<codename>`) both by the daemon
+(`detect_model()`, exits on unknown hardware) and by `install.sh` (`ARCH_OF`: codename → binary).
+Adding a model: hardware study first (ALSA capture layout, VQE preset, spotter channels, LEDs,
+clock, inputs, earcons), then a `Model` in `src/model.cpp` and an `ARCH_OF` entry.
 
-Manual binary update (e.g. over ssh when adb push is flaky for the ~24 MB binary):
+Manual binary update (e.g. over ssh):
 
 ```sh
-scp satellite/build/cucumber-satellite root@<ip>:/data/cucumber-satellite/cucumber-satellite.new
+scp satellite/build/<arch>/cucumber-satellite root@<ip>:/data/cucumber-satellite/cucumber-satellite.new
 ssh root@<ip> 'cd /data/cucumber-satellite && cp cucumber-satellite cucumber-satellite.prev &&
   mv cucumber-satellite.new cucumber-satellite && ./ctl.sh restart'
 ```
@@ -81,17 +88,17 @@ state.conf,enabled,sendspin/}`. Log: `/tmp/cucumber-satellite.log` (`ctl.sh log 
   separate binary on another port with the service stopped (`ctl.sh disable` or kill the supervisor).
 - No volume changes or test sounds on a live speaker without the owner's consent; tests that play
   audio must cap volume.
-- `/tmp` is tmpfs on a 1 GB device: remove test files afterwards.
+- `/tmp` is tmpfs (1 GB RAM on the Midi, 237 MB on the Lite 2): remove test files afterwards.
 
 ## Yandex libraries (reverse-engineered C API, see `src/audio/frontend.cpp`)
 
 From `/system/vendor/quasar/libyandex_evil.so`:
 
-- VQE: `YandexVqeC_Config_CreateFromPreset("cucumber", &cfg)`,
+- VQE: `YandexVqeC_Config_CreateFromPreset(<Model::vqe_preset>, &cfg)`,
   `YandexVqeC_Create(cfg, "/system/vendor/quasar/vqe_models", 0, nullptr, &vqe)`,
-  `YandexVqeC_Process(vqe, mics, 4 * 3072, spk, 4 * 3072)` with float samples in [-1, 1] (mic
-  channels 0–3 and speaker reference channels 4–7 of `hw:0,2`, 8 ch @ 96 kHz),
-  `YandexVqeC_GetOutputChannelData(vqe, type, idx, &ptr, &n)` → 512 samples @ 16 kHz.
+  `YandexVqeC_Process(vqe, mics, nmic * chunk, spk, nspk * chunk)` with float samples in [-1, 1],
+  frame-interleaved (Midi: 4 mics + 4 speaker refs, chunk 3072 @ 96 kHz; Lite 2: 2 + 1, chunk
+  1536 @ 48 kHz), `YandexVqeC_GetOutputChannelData(vqe, type, idx, &ptr, &n)` → 512 samples @ 16 kHz.
 - Spotter: `spotter_create_multichannel(conf, 16000, n, types, false, &err)`,
   `spotter_submit_raw_data(sp, s16_interleaved, bytes, &err)`. Channel count per type comes from the
   model config. Hit events: 2 and 5.
@@ -104,32 +111,32 @@ From `/system/vendor/quasar/libyandex_evil.so`:
 - `YandexVqeC_Config_GetOutputChannelCount` takes `(cfg, type, int *out)`; the other `Config_Get*`
   getters return the value directly.
 
-## Station Lite 2 (`plum`) — studied, not supported yet
-
-Findings from the live device (firmware 0.369.1.46, read-only study):
+## Model notes
 
 | | Midi (`cucumber`) | Lite 2 (`plum`) |
 |---|---|---|
 | SoC / userland | Amlogic A5, aarch64, glibc 2.36, 1 GB RAM | Amlogic AXG, Cortex-A53, **32-bit armhf** userland, glibc 2.30, kernel 4.9, **237 MB RAM** |
 | Storage | `/data` partition (several GB) | `/data` → `/bkupgrade/data` (ubifs, ~81 MB free); rootfs ubifs ro, 87 % full |
-| Capture | `hw:0,2`, 8 ch @ 96 kHz: mics 0–3, speaker ref 4–7 | `hw:0,1`, 8 ch @ 48 kHz: mics on ch 0 and 2, speaker feedback on ch 6 (`/etc/asound.conf`, `multi_capture_raw`) |
+| Capture | `hw:0,2`, 8 ch @ 96 kHz: mics 0–3, speaker ref 4–7 | `hw:0,1`, 8 ch @ 48 kHz: mic 0 on ch 0 (= ch 1), mic 1 on ch 2 (= ch 3), speaker feedback on ch 6; ch 4/5 only carry a start-up transient. Max buffer 2048 frames (~42 ms) |
 | VQE preset | `cucumber`: 4 mics, 4 spk, chunk 3072 | `plum`: 2 mics, 1 spk, 48 kHz, chunk 1536 → 512 @ 16 kHz; outputs 1, 2, 4, 6, 8, 9 |
 | Spotters | alisa: types 0, 3, 4; command: type 0 | alisa/yandex: types 0 and 4 (1 ch each); command: type 0. Models in `spotter_models/` are plum-tuned |
-| Ring | `/dev/fb0` 24×1 + `/dev/fb1` logo 6×1, BGR | `/dev/fb0` "YNDX LED ring" 3×1, 24 bpp, r 16 / g 8 / b 0 (BGR bytes); trigger `led_ring_fb`; no logo |
-| Clock | `cucumber:white:clock-<seg><digit>`, dimming via chip `current` | `plum:white:clock<part><pos>`: parts A–H × positions 0–3, colon `DH`+`DL`, also `DM`, `DEGREE` (36 LEDs, see `quasar.cfg` `/leds/clock`); dimming via per-LED `brightness` 0–255 |
-| Keys | `awinic_sar`: 582 action, 115/114 volume | `aw9610x`: same codes 582, 115, 114 |
+| Ring | `/dev/fb0` 24×1 + `/dev/fb1` logo 6×1, BGR | `/dev/fb0` "YNDX LED ring" 3×1, 24 bpp, BGR; trigger `led_ring_fb`; sysfs `plum:<color>:ring1..3`; no logo |
+| Clock | `cucumber:white:clock-<seg><digit>`, dimming via chip `current` | `plum:white:clock<SEG><pos>`: A–G × 0–3, colon `DH`+`DL`; `H0..3`, `DM`, `DEGREE` kept dark (`quasar.cfg` `/leds/clock`); dimming via per-LED `brightness` 0–255 |
+| Keys | `awinic_sar`: 582 action, 115/114 volume | `aw9610x`: same codes |
 | Mic mute | input `mute`: `SW_MUTE_DEVICE` | input `gpio-keys`: `SW_MUTE_DEVICE` (+ `KEY_MUTE`) |
 | Light sensor | `ltr308als01` (iio) | same |
-| Volume | "Master Playback Volume" softvol on `speakers` | same names; dmix 48 kHz stereo |
-| Earcons | `common/spotter_*.mp3`, `timer.wav`, `ru-RU/vins_error.wav` | same except no `vins_error.wav` (`ru-RU/playback_error.mp3` exists) |
+| Volume | "Master Playback Volume" softvol on `speakers` | same names; `speakers` comes from `/etc/init.d/S45amplifier-settings` (`/tmp/asound-vol.conf`) |
+| alsa-lib | 1.2.10, versioned | 1.2.1.2, unversioned |
+| Earcons | `common/spotter_*.mp3`, `timer.wav`, `ru-RU/vins_error.wav` | same except `ru-RU/playback_error.mp3` instead of `vins_error.wav` |
 | Boot hook | `onboot.sh` → `/data/quasar/rootkeeper.sh` | same (line 67); `q stop` available |
 
-Toolchain: zig 0.13 C++ release builds for `arm-linux-gnueabihf.2.30` crash before `main` (debug
-builds and C work); zig 0.14.1 builds run. A plum port needs zig ≥ 0.14.1 for both targets.
+Lite 2 measurements: echo test (speech played through `speakers`, raw capture → `ww_offline`):
+speaker reference ch 6 gives ~25–30 dB lower VQE output than ch 4 and no false "алиса" hit from the
+played speech. Daemon: ~23 MB RSS, ~7 % CPU idle-listening. Capture overran the 42 ms device
+buffer when reading and VQE shared a thread; hence the separate capture thread with a FIFO.
 
-Not yet verified on plum: mic channel mapping under speech (the hardware mic mute was on during the
-study, so capture contained no usable signal), GStreamer playback through the 32-bit
-`libquasar_gstreamer.so`, Sendspin on armhf, memory headroom with the Yandex stack stopped.
+Not yet verified on the Lite 2: wake word → HA pipeline → TTS end to end, GStreamer playback
+through the 32-bit `libquasar_gstreamer.so`, Sendspin playback, LED animations by eye.
 
 ## Conventions
 

@@ -1,10 +1,12 @@
-// Buttons of the Station Midi via evdev (devices matched by name in /proc/bus/input/devices).
+// Buttons via evdev (devices matched by name in /proc/bus/input/devices, names per Model).
+// Station Midi: touch keys "awinic_sar", mute switch "mute"; Station Lite 2: touch keys "aw9610x",
+// mute switch "gpio-keys". Both use the same key codes and switch:
 //
-// "awinic_sar" (capacitive touch keys, EV_KEY only; KEY bitmap "40 0 0 0 0 0 0 0 c000000000000 0"):
+// touch keys (capacitive, EV_KEY only; Midi KEY bitmap "40 0 0 0 0 0 0 0 c000000000000 0"):
 //   KEY_VOICECOMMAND (582) -> ACTION   (maind: "ACTIVATE")
 //   KEY_VOLUMEUP     (115) -> VOLUME_UP
 //   KEY_VOLUMEDOWN   (114) -> VOLUME_DOWN
-// "mute" (gpio-keys, KEY bitmap bit 113 KEY_MUTE, SW bitmap 0x4000 = SW_MUTE_DEVICE (14)):
+// mute switch (gpio-keys, KEY bitmap bit 113 KEY_MUTE, SW bitmap 0x4000 = SW_MUTE_DEVICE (14)):
 //   the hardware microphone mute slider/toggle; SW_MUTE_DEVICE=1 means muted. Its KEY_MUTE
 //   press/release events are ignored, the switch state is authoritative (initial value via
 //   EVIOCGSW).
@@ -65,8 +67,9 @@ bool test_bit(const unsigned long *bits, int n) {
 }  // namespace
 
 struct Input::Impl {
-  explicit Impl(Loop &l) : loop(l) {}
+  Impl(Loop &l, const Model &m) : loop(l), model(m) {}
   Loop &loop;
+  const Model &model;
   int keys_fd = -1, mute_fd = -1;
   bool muted = false;
   ButtonCb button_cb;
@@ -231,10 +234,10 @@ struct Input::Impl {
     }
   }
 
-  int open_dev(const char *name, bool quiet) {
+  int open_dev(const std::string &name, bool quiet) {
     std::string path = find_event_dev(name);
     if (path.empty()) {
-      if (!quiet) LOGE("input: device \"%s\" not found", name);
+      if (!quiet) LOGE("input: device \"%s\" not found", name.c_str());
       return -1;
     }
     int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -242,7 +245,7 @@ struct Input::Impl {
       if (!quiet) LOGE("input: open %s: %s", path.c_str(), strerror(errno));
       return -1;
     }
-    LOGI("input: \"%s\" -> %s", name, path.c_str());
+    LOGI("input: \"%s\" -> %s", name.c_str(), path.c_str());
     loop.add_fd(fd, EPOLLIN, [this, fd](uint32_t) { drain(fd); });
     return fd;
   }
@@ -250,24 +253,24 @@ struct Input::Impl {
   // Devices that were missing at start or vanished (ENODEV) are looked up again.
   void reopen_missing() {
     if (keys_fd < 0) {
-      keys_fd = open_dev("awinic_sar", true);
+      keys_fd = open_dev(model.keys_input, true);
       keys_dropped = false;
     }
     if (mute_fd < 0) {
-      mute_fd = open_dev("mute", true);
+      mute_fd = open_dev(model.mute_input, true);
       mute_dropped = false;
       if (mute_fd >= 0) read_mute_state();
     }
   }
 };
 
-Input::Input(Loop &loop) : impl_(new Impl(loop)) {}
+Input::Input(Loop &loop, const Model &model) : impl_(new Impl(loop, model)) {}
 Input::~Input() = default;
 
 bool Input::open() {
   auto &d = *impl_;
-  d.keys_fd = d.open_dev("awinic_sar", false);
-  d.mute_fd = d.open_dev("mute", false);
+  d.keys_fd = d.open_dev(d.model.keys_input, false);
+  d.mute_fd = d.open_dev(d.model.mute_input, false);
   if (d.mute_fd >= 0) {
     d.read_mute_state();
     LOGI("input: initial hardware mute %s", d.muted ? "on" : "off");

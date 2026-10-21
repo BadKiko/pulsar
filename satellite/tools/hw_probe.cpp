@@ -13,6 +13,7 @@
 #include "core/log.h"
 #include "core/loop.h"
 #include "hw/hw.h"
+#include "model.h"
 
 using namespace cs;
 
@@ -79,10 +80,12 @@ int main(int argc, char **argv) {
     }
   }
 
+  const Model *model = detect_model();
+  if (!model) return 1;
   Loop loop;
-  Leds leds(loop);
-  Clock clock(loop);
-  Input input(loop);
+  Leds leds(loop, *model);
+  Clock clock(loop, *model);
+  Input input(loop, *model);
   LightSensor light(loop);
   printf("open: leds=%d clock=%d input=%d light=%d hw_muted=%d\n", leds.open(), clock.open(), input.open(),
          light.open(), input.hw_muted());

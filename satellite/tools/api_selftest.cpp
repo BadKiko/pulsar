@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
 
   Loop loop;
   TestHooks hooks(loop);
-  DeviceIdentity id{name, "Яндекс Станция Миди (selftest)", read_mac(), "Yandex Station Midi", "Yandex", "0.1.0"};
+  DeviceIdentity id{name, "Яндекс Станция Миди (selftest)", read_mac(), "Yandex Station Midi", "cucumber", "Yandex", "0.1.0"};
   ApiConfig cfg;
   cfg.port = port;
   cfg.wake_words = {{"alisa", "Алиса", {"ru"}}, {"yandex", "Яндекс", {"ru"}}};

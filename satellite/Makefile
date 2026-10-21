@@ -33,12 +33,19 @@ ifeq ($(ARCH),aarch64)
 TARGET := aarch64-linux-gnu.2.36
 CPU    :=
 HOST   := aarch64-linux-gnu
+ALSA   :=
 else ifeq ($(ARCH),armhf)
 TARGET := arm-linux-gnueabihf.2.30
 CPU    := -mcpu=cortex_a53
 HOST   := arm-linux-gnueabihf
+ALSA   := --with-versioned=no
 else
 $(error ARCH must be one of: $(ARCHES))
+endif
+
+ZIG_VERSION := $(shell $(ZIG) version 2>/dev/null)
+ifneq ($(filter 0.11.% 0.12.% 0.13.%,$(ZIG_VERSION)),)
+$(error zig $(ZIG_VERSION) is too old (armhf C++ binaries crash before main); use zig 0.14.1, e.g. make ZIG=/path/to/zig)
 endif
 
 export ZIG
@@ -96,7 +103,7 @@ $(BUILD)/%.o: src/%.cpp | $(SS_STAMP) $(SYSROOT_STAMP)
 
 # alsa-lib headers + libasound.so to compile and link against (runtime uses the firmware's copy).
 $(SYSROOT_STAMP): third_party/sysroot.sh
-	env -u MAKEFLAGS -u MFLAGS third_party/sysroot.sh $(SYSROOT) "$(TARGET) $(CPU)" $(HOST)
+	env -u MAKEFLAGS -u MFLAGS third_party/sysroot.sh $(SYSROOT) "$(TARGET) $(CPU)" $(HOST) "$(ALSA)"
 	touch $@
 
 # Fetch (once) + configure + build the Sendspin library and its dependencies.
