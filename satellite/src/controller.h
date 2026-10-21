@@ -48,6 +48,8 @@ class Controller : public ApiHooks {
   void on_number(NumberId id, float value) override;
   void on_time(uint32_t epoch_seconds, const std::string &posix_tz) override;
   void on_restart() override;
+  void on_voice_start_failed() override;
+  void on_voice_audio_overflow() override;
 
  private:
   enum class Phase { IDLE, LISTENING, PROCESSING, SPEAKING };
@@ -62,6 +64,8 @@ class Controller : public ApiHooks {
   void play_tts();
   void tts_finished(bool ok);
   void finish_interaction();
+  void abort_dialog(const char *why);
+  void arm_watchdog();
   void interrupt_speech();
   void end_announce();
   void play_closing_earcon(const std::string &path);
@@ -95,6 +99,7 @@ class Controller : public ApiHooks {
   int64_t listen_started_ms_ = 0;  // start of the current LISTENING phase (commands window)
   bool hw_mic_muted_ = false;
   bool error_shown_ = false;
+  uint64_t watchdog_ = 0;  // loop timer ending a LISTENING/PROCESSING phase HA never advances
   std::string tts_url_;
   bool tts_played_ = false;
   bool continue_conversation_ = false;

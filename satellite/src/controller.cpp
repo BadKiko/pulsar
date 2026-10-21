@@ -24,6 +24,11 @@ const std::string kSndCancel = std::string(kSounds) + "common/spotter_cancel.mp3
 const std::string kSndTimer = std::string(kSounds) + "common/timer.wav";
 constexpr float kDuckGain = 0.15f;
 constexpr int64_t kTimerRingMaxMs = 15 * 60 * 1000;
+// Longest wait for the next pipeline event before the dialog is given up locally. HA's voice
+// command segmenter ends speech capture after at most 15 s of audio; conversation agents (LLMs
+// with tool calls) can think for tens of seconds, streamed ones report INTENT_PROGRESS meanwhile.
+constexpr int64_t kListenTimeoutMs = 30'000;
+constexpr int64_t kProcessTimeoutMs = 60'000;
 constexpr uint16_t kSendspinPort = 8928;
 
 std::string read_line(const char *path) {
@@ -290,6 +295,7 @@ void Controller::start_pipeline(const std::string &phrase, bool earcon) {
   if (earcon) player_.play(Channel::ANNOUNCE, {kSndWake});
   api_->voice_request_start(phrase);
   mic_.set_streaming(true);
+  arm_watchdog();
   update_ui();
 }
 
@@ -344,6 +350,7 @@ void Controller::on_voice_event(VaEvent type, const std::map<std::string, std::s
     default:
       break;
   }
+  arm_watchdog();
 }
 
 void Controller::play_tts() {
@@ -374,12 +381,42 @@ void Controller::finish_interaction() {
   tts_played_ = false;
   continue_conversation_ = false;
   update_duck();
+  arm_watchdog();
   if (error_shown_) {
     error_shown_ = false;
     loop_.add_timer(1200, [this] { update_ui(); });
   } else {
     update_ui();
   }
+}
+
+// The dialog failed without a pipeline run to end it: error ring, then idle.
+void Controller::abort_dialog(const char *why) {
+  LOGW("voice pipeline: %s", why);
+  error_shown_ = true;
+  leds_.set_ui_state(UiState::ERROR);
+  finish_interaction();
+}
+
+void Controller::on_voice_start_failed() {
+  if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) abort_dialog("Home Assistant refused to start it");
+}
+
+void Controller::on_voice_audio_overflow() {  // the server has already asked HA to stop
+  if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) abort_dialog("network too slow for the microphone audio");
+}
+
+// Without it a run HA never ends (lost connection state, a hung agent) would leave the ring
+// listening, the microphone streaming and the wake word ignored.
+void Controller::arm_watchdog() {
+  if (watchdog_) loop_.cancel_timer(watchdog_);
+  watchdog_ = 0;
+  if (phase_ != Phase::LISTENING && phase_ != Phase::PROCESSING) return;
+  watchdog_ = loop_.add_timer(phase_ == Phase::LISTENING ? kListenTimeoutMs : kProcessTimeoutMs, [this] {
+    watchdog_ = 0;
+    api_->voice_request_stop();
+    abort_dialog("no progress from Home Assistant, giving up");
+  });
 }
 
 // Cuts the TTS answer or HA announcement short. An interrupted announcement ends here (its
