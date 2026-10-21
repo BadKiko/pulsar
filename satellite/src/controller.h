@@ -62,12 +62,13 @@ class Controller : public ApiHooks {
   void tts_finished(bool ok);
   void finish_interaction();
   void interrupt_speech();
+  void end_announce();
   void stop_timer_ring();
   void ring_timer();
   void resume_ring();
   void update_ui();
   void update_detection();
-  void duck(bool on);
+  void update_duck();
   void set_volume(float v, bool feedback);
   void set_muted(bool m);
   void start_sendspin(const DeviceIdentity &id);
@@ -94,7 +95,8 @@ class Controller : public ApiHooks {
   std::string tts_url_;
   bool tts_played_ = false;
   bool continue_conversation_ = false;
-  bool announcing_ = false;
+  bool announcing_ = false;  // an HA announcement (assist or media player) plays on ANNOUNCE
+  bool ducked_ = false;
   // Completion callbacks act only for what is still current: dialog_ changes whenever a dialog
   // starts or ends, announce_seq_ whenever an HA announcement starts or is interrupted.
   uint64_t dialog_ = 0;

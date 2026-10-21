@@ -164,13 +164,14 @@ bool Controller::start() {
         if (p == Press::LONG) return;  // exposed to HA automations only
         if (sendspin_pairing_prompt_ && sendspin_) return sendspin_->confirm_pairing_window();
         if (timer_ringing_) return stop_timer_ring();
-        if (phase_ == Phase::SPEAKING || announcing_) {
-          interrupt_speech();
-          return finish_interaction();
-        }
         if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) {
           api_->voice_request_stop();
+          interrupt_speech();  // an announcement playing over the dialog goes with it
           player_.play(Channel::ANNOUNCE, {kSndCancel});
+          return finish_interaction();
+        }
+        if (phase_ == Phase::SPEAKING || announcing_) {
+          interrupt_speech();
           return finish_interaction();
         }
         start_pipeline("", true);
@@ -282,7 +283,7 @@ void Controller::start_pipeline(const std::string &phrase, bool earcon) {
   tts_url_.clear();
   tts_played_ = false;
   continue_conversation_ = false;
-  duck(true);
+  update_duck();
   if (earcon) player_.play(Channel::ANNOUNCE, {kSndWake});
   api_->voice_request_start(phrase);
   mic_.set_streaming(true);
@@ -369,7 +370,7 @@ void Controller::finish_interaction() {
   dialog_++;
   tts_played_ = false;
   continue_conversation_ = false;
-  if (!timer_ringing_ && !announcing_) duck(false);
+  update_duck();
   if (error_shown_) {
     error_shown_ = false;
     loop_.add_timer(1200, [this] { update_ui(); });
@@ -389,29 +390,37 @@ void Controller::interrupt_speech() {
   }
 }
 
+// Announcements do not take over the dialog phase, and their end leaves any dialog alone. HA
+// cancels its own running pipeline before it announces (assist_satellite async_internal_announce),
+// so a dialog still active here is either ending (its RUN_END or the watchdog follows) or was
+// started by HA after the announcement.
 void Controller::on_announce(const AnnounceRequest &req) {
-  LOGI("announce: '%s'", req.text.c_str());
+  LOGI("announce: '%s'%s", req.text.c_str(), phase_ == Phase::IDLE ? "" : " (during a dialog)");
   std::vector<std::string> urls;
   if (!req.preannounce_media_id.empty()) urls.push_back(req.preannounce_media_id);
   urls.push_back(req.media_id);
-  duck(true);
-  phase_ = Phase::SPEAKING;
   announcing_ = true;
-  update_ui();
   const bool conv = req.start_conversation;
   const uint64_t seq = ++announce_seq_;
+  update_duck();
+  update_ui();
+  publish_media();
   player_.play(Channel::ANNOUNCE, urls, [this, conv, seq](bool ok) {
     api_->voice_announce_finished(ok);  // exactly once per announcement, also when cut short
     if (seq == announce_seq_) {
       announcing_ = false;
-      if (ok && conv && !timer_ringing_ && !st_.mic_muted && !hw_mic_muted_) {
+      if (ok && conv && phase_ == Phase::IDLE && !timer_ringing_ && !st_.mic_muted && !hw_mic_muted_)
         start_pipeline("", false);
-      } else {
-        finish_interaction();
-      }
+      end_announce();
     }
     resume_ring();
   });
+}
+
+void Controller::end_announce() {
+  update_duck();
+  update_ui();
+  publish_media();
 }
 
 // ---------------- timers ----------------
@@ -457,7 +466,7 @@ void Controller::on_timer_event(const TimerInfo &t) {
       if (!timer_ringing_) {
         timer_ringing_ = true;
         timer_ring_started_ms_ = Loop::now_ms();
-        duck(true);
+        update_duck();
         update_ui();
         ring_timer();
       }
@@ -492,15 +501,19 @@ void Controller::stop_timer_ring() {
   if (timer_ring_tick_) loop_.cancel_timer(timer_ring_tick_);
   timer_ring_tick_ = 0;
   interrupt_speech();  // the ring, or the speech it yielded to
-  if (phase_ == Phase::IDLE) duck(false);
+  update_duck();
   update_ui();
 }
 
 // ---------------- media ----------------
 
-void Controller::duck(bool on) {
-  player_.set_channel_gain(Channel::MUSIC, on ? kDuckGain : 1.0f);
-  if (sendspin_) sendspin_->set_duck_gain(on ? kDuckGain : 1.0f);
+// Music (HA media channel and Sendspin) is ducked while a dialog, HA announcement or timer ring is on.
+void Controller::update_duck() {
+  const bool want = phase_ != Phase::IDLE || announcing_ || timer_ringing_;
+  if (want == ducked_) return;
+  ducked_ = want;
+  player_.set_channel_gain(Channel::MUSIC, want ? kDuckGain : 1.0f);
+  if (sendspin_) sendspin_->set_duck_gain(want ? kDuckGain : 1.0f);
 }
 
 void Controller::start_sendspin(const DeviceIdentity &id) {
@@ -587,16 +600,14 @@ void Controller::on_media_command(const MediaCommandRequest &cmd) {
   if (cmd.has_media_url) {
     if (cmd.has_announcement && cmd.announcement) {
       // Media-player announcements report completion through state only.
-      duck(true);
       announcing_ = true;
-      phase_ = phase_ == Phase::IDLE ? Phase::SPEAKING : phase_;
-      update_ui();
       const uint64_t seq = ++announce_seq_;
+      update_duck();
+      update_ui();
       player_.play(Channel::ANNOUNCE, {cmd.media_url}, [this, seq](bool) {
         if (seq == announce_seq_) {
           announcing_ = false;
-          finish_interaction();
-          publish_media();
+          end_announce();
         }
         resume_ring();
       });
@@ -740,9 +751,13 @@ void Controller::on_command(const std::string &word) {
     case STOP:
       if (timer_ringing_) {
         stop_timer_ring();
-      } else if (phase_ == Phase::SPEAKING || announcing_) {
+      } else if (phase_ == Phase::SPEAKING) {
         interrupt_speech();
         finish_interaction();
+      } else if (announcing_) {  // a dialog listening meanwhile goes on
+        interrupt_speech();
+        update_duck();
+        update_ui();
       } else {
         music_pause();
       }
