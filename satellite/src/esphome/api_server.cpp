@@ -206,10 +206,22 @@ struct ApiServer::Impl {
 
   Impl(Loop &l, DeviceIdentity i, ApiConfig c, ApiHooks &h) : loop(l), id(std::move(i)), cfg(std::move(c)), hooks(h) {}
 
+  // Runs while the owner is being torn down: no hooks from here.
   ~Impl() {
     if (tick_timer) loop.cancel_timer(tick_timer);
     for (auto &c : clients) {
       loop.del_fd(c->fd);
+      if (c->hello) {
+        // Best effort, the loop no longer runs: with a DisconnectRequest HA treats the close
+        // as expected and reconnects quietly once the daemon is back.
+        append_frame(*c, DISCONNECT_REQ, pb::Writer());
+        (void)!send(c->fd, c->wbuf.data() + c->woff, c->wbuf.size() - c->woff, MSG_NOSIGNAL | MSG_DONTWAIT);
+        shutdown(c->fd, SHUT_WR);
+        // Unread input at close() makes the kernel send RST, which may discard what was just sent.
+        char buf[4096];
+        while (recv(c->fd, buf, sizeof buf, MSG_DONTWAIT) > 0) {
+        }
+      }
       close(c->fd);
     }
     clients.clear();
@@ -272,6 +284,20 @@ struct ApiServer::Impl {
     return true;
   }
 
+  // Wi-Fi drops leave half-open connections that never see a FIN. Keepalive probes detect an
+  // idle dead peer in ~35 s and TCP_USER_TIMEOUT a stalled one (e.g. during mic streaming) in
+  // 30 s, well before the API-level ping timeout.
+  static void configure_socket(int fd) {
+    int one = 1, idle = 20, intvl = 5, cnt = 3;
+    unsigned user_timeout_ms = 30000;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof user_timeout_ms);
+  }
+
   void on_accept() {
     for (;;) {
       sockaddr_in sa{};
@@ -282,14 +308,13 @@ struct ApiServer::Impl {
         if (errno != EAGAIN && errno != EWOULDBLOCK) LOGW("api: accept: %s", strerror(errno));
         return;
       }
-      size_t unauthenticated = size_t(std::count_if(clients.begin(), clients.end(), [](const ClientPtr &c) { return !c->hello; }));
+      size_t unauthenticated =
+          size_t(std::count_if(clients.begin(), clients.end(), [](const ClientPtr &c) { return !c->hello; }));
       if (unauthenticated >= kMaxPending) {
         auto oldest = *std::find_if(clients.begin(), clients.end(), [](const ClientPtr &c) { return !c->hello; });
         close_client(oldest, "superseded by newer connections");
       }
-      int one = 1;
-      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-      setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+      configure_socket(fd);
       char ip[INET_ADDRSTRLEN];
       inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof ip);
       auto c = std::make_shared<Client>();
@@ -401,16 +426,20 @@ struct ApiServer::Impl {
     if (eof) close_client(c, "connection closed by peer");
   }
 
+  static void append_frame(Client &c, uint32_t type, const pb::Writer &w) {
+    if (c.woff && c.woff == c.wbuf.size()) {
+      c.wbuf.clear();
+      c.woff = 0;
+    }
+    c.wbuf.push_back(0);
+    pb::put_varint(c.wbuf, w.size());
+    pb::put_varint(c.wbuf, type);
+    c.wbuf += w.data();
+  }
+
   void send_msg(const ClientPtr &c, uint32_t type, const pb::Writer &w) {
     if (c->closed) return;
-    if (c->woff && c->woff == c->wbuf.size()) {
-      c->wbuf.clear();
-      c->woff = 0;
-    }
-    c->wbuf.push_back(0);
-    pb::put_varint(c->wbuf, w.size());
-    pb::put_varint(c->wbuf, type);
-    c->wbuf += w.data();
+    append_frame(*c, type, w);
     flush(c);
   }
 
