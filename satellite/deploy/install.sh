@@ -139,7 +139,7 @@ probe() { # serial connected_by_us
 
 # errexit does not apply inside a function called from `||`: every step checks its own status.
 install_one() { # serial
-  local s=$1 want got have hooks tmp f changed=1
+  local s=$1 want got have hooks tmp f changed=1 sup_changed=1 sup_have action mark
   local bin=$SAT/build/${ARCH_FOR[$s]}/cucumber-satellite ssh_out=$ROOT/ssh/out/${ARCH_FOR[$s]}
   [ -s "$bin" ] || { echo "$s: $bin missing" >&2; return 1; }
   echo "== $s: daemon (${ARCH_FOR[$s]})"
@@ -159,6 +159,9 @@ install_one() { # serial
     fi
   fi
   # Scripts: a running shell reads its script incrementally, so replace them atomically (new inode).
+  # A running supervisor keeps executing the old inode: when supervise.sh changed it is reloaded below.
+  sup_have=$(sh_ "$s" "[ -f $D/supervise.sh ] && sha256sum $D/supervise.sh" | cut -d' ' -f1 || true)
+  [ "$sup_have" != "$(sha256sum "$SAT/deploy/supervise.sh" | cut -d' ' -f1)" ] || sup_changed=0
   for f in boot.sh supervise.sh ctl.sh; do adb -s "$s" push "$SAT/deploy/$f" "$D/$f.new" >/dev/null || return 1; done
   sh_ "$s" "cd $D && chmod 755 boot.sh.new supervise.sh.new ctl.sh.new &&
      mv boot.sh.new boot.sh && mv supervise.sh.new supervise.sh && mv ctl.sh.new ctl.sh" || return 1
@@ -216,22 +219,40 @@ install_one() { # serial
   fi
   if [ $ENABLE = 1 ]; then
     echo "== $s: start"
-    if sh_ "$s" "pidof cucumber-satellite >/dev/null"; then sh_ "$s" "$D/ctl.sh restart"; else sh_ "$s" "$D/ctl.sh enable"; fi
+    # Marker in the log: the health check looks only at what happens after it.
+    mark="=== install-marker $$ $(date +%s)"
+    sh_ "$s" "echo '$mark' >> /tmp/cucumber-satellite.log" || true
+    action=restart
+    [ $sup_changed = 0 ] || action=reload
+    sh_ "$s" "if [ -f $D/enabled ] && { pidof supervise.sh || pidof cucumber-satellite; } >/dev/null; then $D/ctl.sh $action; else $D/ctl.sh enable; fi"
     echo
-    health_check "$s" "$changed" || return 1
+    health_check "$s" "$changed" "$mark" || return 1
     sh_ "$s" "$D/ctl.sh status; $D/ctl.sh log 5"
     echo
   fi
 }
 
-# After a (re)start: the process must be alive after ~10 s and the log since the last start must
-# have neither a crash report nor an exit. On failure, offer to put the previous binary back.
-health_check() { # serial binary_changed
-  local s=$1 changed=$2 log ans
-  sleep 10
-  log=$(sh_ "$s" "tail -n 300 /tmp/cucumber-satellite.log" || true)
-  log=${log##*=== start}
-  if sh_ "$s" "pidof cucumber-satellite >/dev/null" && [[ $log != *"=== CRASH"* && $log != *"=== exit"* && $log != *"=== supervise"* ]]; then
+# After a (re)start, at ~10 s and again at ~30 s: the process is alive and, in the log after the
+# install marker, there is exactly one `=== start` and no crash report, exit or supervisor message
+# (a binary that crashes and is restarted in between would otherwise look healthy). On failure,
+# offer to put the previous binary back.
+health_check() { # serial binary_changed marker
+  local s=$1 changed=$2 mark=$3 log ans n bad=0 round
+  for round in 1 2; do
+    if [ $round = 1 ]; then sleep 10; else sleep 20; fi
+    log=$(sh_ "$s" "tail -n 600 /tmp/cucumber-satellite.log" || true)
+    if [[ $log != *"$mark"* ]]; then
+      log="(install marker not found in the log: rotated?)"
+      bad=1
+    else
+      log=${log#*"$mark"}
+      n=$(grep -c '^=== start' <<<"$log" || true)
+      if ! sh_ "$s" "pidof cucumber-satellite >/dev/null" || [ "$n" != 1 ] \
+        || [[ $log == *"=== CRASH"* || $log == *"=== exit"* || $log == *"=== supervise"* ]]; then bad=1; fi
+    fi
+    [ $bad = 0 ] || break
+  done
+  if [ $bad = 0 ]; then
     echo "$s: health check ok"
     return 0
   fi
