@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -54,6 +55,8 @@ class AudioFrontend {
   std::unique_ptr<Engine> eng_;
   std::thread thr_;
   std::atomic<bool> running_{false};
+  std::mutex stop_mu_;  // with stop_cv_: wakes the capture thread's retry sleep on stop()
+  std::condition_variable stop_cv_;
   std::atomic<bool> detect_{true};
   std::atomic<bool> commands_{false};
   std::atomic<bool> stream_{false};

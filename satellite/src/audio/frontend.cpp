@@ -234,7 +234,11 @@ bool AudioFrontend::start(const std::string &model_dir, const std::string &comma
 }
 
 void AudioFrontend::stop() {
-  running_ = false;
+  {
+    std::lock_guard<std::mutex> lk(stop_mu_);
+    running_ = false;
+  }
+  stop_cv_.notify_all();
   if (thr_.joinable()) thr_.join();
   eng_.reset();
 }
@@ -248,29 +252,42 @@ void AudioFrontend::run() {
   Engine &e = *eng_;
   snd_pcm_t *pcm = nullptr;
   const snd_pcm_uframes_t period = e.chunk;
+  // Fails loudly if the device does not give exactly the layout the VQE preset expects: a silent
+  // rate/period mismatch would feed the VQE and spotters wrongly timed audio.
   auto open_pcm = [&]() -> bool {
-    int err = snd_pcm_open(&pcm, kPcm, SND_PCM_STREAM_CAPTURE, 0);
+    // Non-blocking: reads never wait inside ALSA, so stop() is never stuck in snd_pcm_readi.
+    int err = snd_pcm_open(&pcm, kPcm, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
     if (err < 0) {
       LOGE("snd_pcm_open %s: %s", kPcm, snd_strerror(err));
-      return false;
-    }
-    snd_pcm_hw_params_t *hw;
-    snd_pcm_hw_params_alloca(&hw);
-    snd_pcm_hw_params_any(pcm, hw);
-    snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
-    snd_pcm_hw_params_set_channels(pcm, hw, kChannels);
-    unsigned rate = kRate;
-    snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, nullptr);
-    snd_pcm_uframes_t per = period, buf = period * 8;
-    snd_pcm_hw_params_set_period_size_near(pcm, hw, &per, nullptr);
-    snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buf);
-    if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
-      LOGE("snd_pcm_hw_params: %s", snd_strerror(err));
-      snd_pcm_close(pcm);
       pcm = nullptr;
       return false;
     }
+    auto fail = [&](const char *what, int e) {
+      LOGE("capture %s: %s: %s", kPcm, what, e < 0 ? snd_strerror(e) : "unexpected value");
+      snd_pcm_close(pcm);
+      pcm = nullptr;
+      return false;
+    };
+    snd_pcm_hw_params_t *hw;
+    snd_pcm_hw_params_alloca(&hw);
+    if ((err = snd_pcm_hw_params_any(pcm, hw)) < 0) return fail("hw_params_any", err);
+    if ((err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) return fail("set_access", err);
+    if ((err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE)) < 0) return fail("set_format", err);
+    if ((err = snd_pcm_hw_params_set_channels(pcm, hw, kChannels)) < 0) return fail("set_channels", err);
+    unsigned rate = kRate;
+    if ((err = snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, nullptr)) < 0) return fail("set_rate_near", err);
+    if (rate != kRate) {
+      LOGE("capture %s: rate %u Hz, need %u", kPcm, rate, kRate);
+      return fail("rate", 0);
+    }
+    snd_pcm_uframes_t per = period, buf = period * 8;
+    if ((err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &per, nullptr)) < 0) return fail("set_period_size_near", err);
+    if (per != period) {
+      LOGE("capture %s: period %lu frames, need %lu", kPcm, (unsigned long)per, (unsigned long)period);
+      return fail("period", 0);
+    }
+    if ((err = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buf)) < 0) return fail("set_buffer_size_near", err);
+    if ((err = snd_pcm_hw_params(pcm, hw)) < 0) return fail("snd_pcm_hw_params", err);
     LOGI("capture %s: %u Hz, %u ch, period %lu, buffer %lu", kPcm, rate, kChannels, (unsigned long)per,
          (unsigned long)buf);
     return true;
@@ -281,7 +298,8 @@ void AudioFrontend::run() {
 
   while (running_) {
     if (!pcm && !open_pcm()) {
-      std::this_thread::sleep_for(std::chrono::seconds(2));
+      std::unique_lock<std::mutex> lk(stop_mu_);
+      stop_cv_.wait_for(lk, std::chrono::seconds(2), [this] { return !running_.load(); });
       continue;
     }
     {
@@ -292,12 +310,18 @@ void AudioFrontend::run() {
         pending_model_.clear();
       }
     }
-    // Read exactly one VQE chunk.
+    // Read exactly one VQE chunk. snd_pcm_wait with a timeout keeps stop() responsive.
     size_t got = 0;
     while (got < period && running_) {
       snd_pcm_sframes_t n = snd_pcm_readi(pcm, in.data() + got * kChannels, period - got);
+      if (n == -EAGAIN) {
+        int w = snd_pcm_wait(pcm, 200);
+        if (w >= 0) continue;  // ready, or timeout (re-checks running_)
+        n = w;
+      }
       if (n < 0) {
         LOGW("capture: %s, recovering", snd_strerror((int)n));
+        got = 0;  // the partial chunk has a gap in it: drop it
         if (snd_pcm_recover(pcm, (int)n, 1) < 0) {
           snd_pcm_close(pcm);
           pcm = nullptr;
