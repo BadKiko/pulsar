@@ -63,6 +63,7 @@ class Controller : public ApiHooks {
   void finish_interaction();
   void interrupt_speech();
   void end_announce();
+  void play_closing_earcon(const std::string &path);
   void stop_timer_ring();
   void ring_timer();
   void resume_ring();
@@ -97,6 +98,8 @@ class Controller : public ApiHooks {
   bool continue_conversation_ = false;
   bool announcing_ = false;  // an HA announcement (assist or media player) plays on ANNOUNCE
   bool ducked_ = false;
+  bool closing_earcon_ = false;
+  uint64_t earcon_seq_ = 0;
   // Completion callbacks act only for what is still current: dialog_ changes whenever a dialog
   // starts or ends, announce_seq_ whenever an HA announcement starts or is interrupted.
   uint64_t dialog_ = 0;

@@ -167,7 +167,7 @@ bool Controller::start() {
         if (phase_ == Phase::LISTENING || phase_ == Phase::PROCESSING) {
           api_->voice_request_stop();
           interrupt_speech();  // an announcement playing over the dialog goes with it
-          player_.play(Channel::ANNOUNCE, {kSndCancel});
+          play_closing_earcon(kSndCancel);
           return finish_interaction();
         }
         if (phase_ == Phase::SPEAKING || announcing_) {
@@ -332,7 +332,7 @@ void Controller::on_voice_event(VaEvent type, const std::map<std::string, std::s
       stop_streaming();
       error_shown_ = true;
       leds_.set_ui_state(UiState::ERROR);
-      if (get("code") != "stt-no-text-recognized") player_.play(Channel::ANNOUNCE, {kSndError});
+      if (get("code") != "stt-no-text-recognized") play_closing_earcon(kSndError);
       break;
     case VaEvent::RUN_END:
       stop_streaming();
@@ -388,6 +388,17 @@ void Controller::interrupt_speech() {
     announcing_ = false;
     announce_seq_++;
   }
+}
+
+// Error and cancel sounds outlive the dialog they close; music stays ducked until they end.
+void Controller::play_closing_earcon(const std::string &path) {
+  closing_earcon_ = true;
+  const uint64_t seq = ++earcon_seq_;
+  player_.play(Channel::ANNOUNCE, {path}, [this, seq](bool) {
+    if (seq != earcon_seq_) return;
+    closing_earcon_ = false;
+    update_duck();
+  });
 }
 
 // Announcements do not take over the dialog phase, and their end leaves any dialog alone. HA
@@ -507,9 +518,10 @@ void Controller::stop_timer_ring() {
 
 // ---------------- media ----------------
 
-// Music (HA media channel and Sendspin) is ducked while a dialog, HA announcement or timer ring is on.
+// Music (HA media channel and Sendspin) is ducked while a dialog, HA announcement, timer ring or
+// closing earcon is on.
 void Controller::update_duck() {
-  const bool want = phase_ != Phase::IDLE || announcing_ || timer_ringing_;
+  const bool want = phase_ != Phase::IDLE || announcing_ || timer_ringing_ || closing_earcon_;
   if (want == ducked_) return;
   ducked_ = want;
   player_.set_channel_gain(Channel::MUSIC, want ? kDuckGain : 1.0f);
