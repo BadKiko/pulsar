@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "core/log.h"
+#include "hw/ambient.h"
 #include "hw/hw.h"
 #include "hw/sysfs.h"
 
@@ -38,6 +39,7 @@ constexpr int kLogo = 6;
 constexpr int kFrameMs = 33;          // ~30 fps while animating
 constexpr float kMaxScale = 0.8f;     // global cap: never drive LEDs above 80 % PWM
 constexpr int64_t kVolumeShowMs = 1500;
+constexpr int64_t kWarnEveryMs = 10000;  // rate limit for repeated per-frame write warnings
 constexpr const char *kLedDir = "/sys/class/leds/";
 
 struct Col {
@@ -64,8 +66,8 @@ Col hsv(float h, float s, float v) {
 // Smooth 0..1 oscillation with period ms, starting at minimum.
 float wave(int64_t t, int64_t period) { return 0.5f - 0.5f * std::cos(float(t % period) / float(period) * 6.2831853f); }
 
-uint8_t to8(float v) {
-  v = std::max(0.f, std::min(1.f, v)) * kMaxScale;
+uint8_t to8(float v, float dim) {
+  v = std::max(0.f, std::min(1.f, v)) * kMaxScale * dim;
   // Gamma 2.0 so that perceived brightness is roughly linear in v.
   return uint8_t(std::lround(v * v * 255.f));
 }
@@ -101,9 +103,13 @@ struct Leds::Impl {
   float volume = 0;
   int64_t volume_until = 0;
   uint64_t timer = 0;
+  AmbientDimmer dimmer;
+  int64_t warn_t[2] = {0, 0};  // last fb0/fb1 write warning
+  unsigned warn_suppressed[2] = {0, 0};
 
   ~Impl() {
     if (timer) loop.cancel_timer(timer);
+    clear();  // do not leave the last frame lit after the daemon exits
     if (fb_ring >= 0) close(fb_ring);
     if (fb_logo >= 0) close(fb_logo);
     for (int fd : sysfs_fds)
@@ -157,17 +163,38 @@ struct Leds::Impl {
     return true;
   }
 
+  // Ring/logo brightness factor from ambient light: 0.3 in the dark .. 1.
+  float dim() const { return 0.3f + 0.7f * (dimmer.factor() - 0.02f) / 0.98f; }
+
+  void clear() {
+    Col off[kRing] = {};
+    have_last = false;
+    output(off, off);
+  }
+
+  void warn_write(int which, const char *what) {
+    int64_t now = Loop::now_ms();
+    if (warn_t[which] && now - warn_t[which] < kWarnEveryMs) {
+      warn_suppressed[which]++;
+      return;
+    }
+    LOGW("leds: %s write: %s (%u similar suppressed)", what, strerror(errno), warn_suppressed[which]);
+    warn_t[which] = now;
+    warn_suppressed[which] = 0;
+  }
+
   void output(const Col *ring, const Col *logo) {
     uint8_t px[(kRing + kLogo) * 3];
+    const float d = dim();
     for (int i = 0; i < kRing; i++) {
-      px[i * 3 + 0] = to8(ring[i].r);
-      px[i * 3 + 1] = to8(ring[i].g);
-      px[i * 3 + 2] = to8(ring[i].b);
+      px[i * 3 + 0] = to8(ring[i].r, d);
+      px[i * 3 + 1] = to8(ring[i].g, d);
+      px[i * 3 + 2] = to8(ring[i].b, d);
     }
     for (int i = 0; i < kLogo; i++) {
-      px[(kRing + i) * 3 + 0] = to8(logo[i].r);
-      px[(kRing + i) * 3 + 1] = to8(logo[i].g);
-      px[(kRing + i) * 3 + 2] = to8(logo[i].b);
+      px[(kRing + i) * 3 + 0] = to8(logo[i].r, d);
+      px[(kRing + i) * 3 + 1] = to8(logo[i].g, d);
+      px[(kRing + i) * 3 + 2] = to8(logo[i].b, d);
     }
     if (fb_ring >= 0) {
       bool ring_changed = !have_last || memcmp(px, last, kRing * 3) != 0;
@@ -179,7 +206,7 @@ struct Leds::Impl {
           bgr[i * 3 + 1] = px[i * 3 + 1];
           bgr[i * 3 + 2] = px[i * 3];
         }
-        if (pwrite(fb_ring, bgr, kRing * 3, 0) != kRing * 3) LOGW("leds: fb0 write: %s", strerror(errno));
+        if (pwrite(fb_ring, bgr, kRing * 3, 0) != kRing * 3) warn_write(0, "fb0");
         ioctl(fb_ring, FBIOPAN_DISPLAY, &var_ring);  // latch
       }
       if (logo_changed) {
@@ -188,7 +215,7 @@ struct Leds::Impl {
           bgr[i * 3 + 1] = px[(kRing + i) * 3 + 1];
           bgr[i * 3 + 2] = px[(kRing + i) * 3];
         }
-        if (pwrite(fb_logo, bgr, kLogo * 3, 0) != kLogo * 3) LOGW("leds: fb1 write: %s", strerror(errno));
+        if (pwrite(fb_logo, bgr, kLogo * 3, 0) != kLogo * 3) warn_write(1, "fb1");
         ioctl(fb_logo, FBIOPAN_DISPLAY, &var_logo);
       }
     } else {
@@ -349,6 +376,11 @@ void Leds::set_user_light(bool on, Rgb color, float brightness, const std::strin
   d.user_bri = std::max(0.f, std::min(1.f, brightness));
   d.effect = effect;
   d.frame();
+}
+
+void Leds::set_ambient_lux(float lux) {
+  auto &d = *impl_;
+  if (d.dimmer.update(lux)) d.frame();
 }
 
 void Leds::show_volume(float v) {

@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "core/log.h"
+#include "hw/ambient.h"
 #include "hw/hw.h"
 #include "hw/sysfs.h"
 
@@ -83,6 +84,7 @@ struct Clock::Impl {
   bool enabled = true;
   float user_bri = 1.f;
   float lux = -1.f;  // <0: unknown, no auto-dimming
+  AmbientDimmer dimmer;
   int64_t timer_end = 0;  // monotonic ms; 0 = no timer
   int64_t flash_until = 0;
   int flash_value = 0;
@@ -119,12 +121,7 @@ struct Clock::Impl {
     colon_last = v;
   }
 
-  // Ambient factor 0.02..1 (log-shaped: dark room ~0.02, 10 lx ~0.4, >=500 lx full).
-  float ambient() const {
-    if (lux < 0) return 1.f;
-    float a = std::log10(1.f + lux) / std::log10(501.f);
-    return 0.02f + 0.98f * std::min(1.f, std::max(0.f, a));
-  }
+  float ambient() const { return dimmer.factor(); }  // 0.02..1, 1 while lux is unknown
 
   void apply_current() {
     int cur = int(std::lround(255.f * user_bri * ambient()));
@@ -282,6 +279,7 @@ void Clock::set_brightness(float b) {
 
 void Clock::set_ambient_lux(float lux) {
   impl_->lux = std::max(0.f, lux);
+  impl_->dimmer.update(impl_->lux);
   impl_->apply_current();
 }
 

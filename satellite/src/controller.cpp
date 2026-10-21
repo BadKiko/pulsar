@@ -185,6 +185,7 @@ bool Controller::start() {
   if (light_.open()) {
     light_.on_lux([this](float lux) {
       clock_.set_ambient_lux(lux);
+      leds_.set_ambient_lux(lux);
       int64_t now = Loop::now_ms();
       float diff = std::abs(lux - last_lux_published_);
       if (last_lux_published_ < 0 || diff > std::max(1.0f, last_lux_published_ * 0.1f) || now - last_lux_ms_ > 60000) {

@@ -38,6 +38,8 @@ class Leds {
   void set_user_light(bool on, Rgb color, float brightness, const std::string &effect);
   // Transient volume indicator (0..1) shown on ring for ~1.5 s.
   void show_volume(float v);
+  // Ambient light: dims the ring and logo (smoothed, with hysteresis; floor keeps them visible).
+  void set_ambient_lux(float lux);
 
  private:
   struct Impl;
