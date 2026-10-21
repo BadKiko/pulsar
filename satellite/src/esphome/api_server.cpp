@@ -1,13 +1,17 @@
 #include "esphome/api_server.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <noise/protocol.h>
 #include <sys/epoll.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 
@@ -72,6 +76,8 @@ enum Msg : uint32_t {
   VA_CONFIG_REQ = 121,
   VA_CONFIG_RESP = 122,
   VA_SET_CONFIG = 123,
+  NOISE_SET_KEY_REQ = 124,
+  NOISE_SET_KEY_RESP = 125,
   DEVICE_CAPS_REQ = 149,
   DEVICE_CAPS_RESP = 150,
 };
@@ -128,6 +134,65 @@ struct FloatState {
 
 float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
 
+// ESPHome Noise transport: frames are [0x01][len BE16][payload]. The first client frame is an
+// empty "client hello", the server answers with a server hello, then one NNpsk0 round trip
+// whose frames start with a status byte (0 = ok, 1 = reject + reason text). Data frames carry
+// an encrypted [type BE16][len BE16][message].
+constexpr const char *kNoiseProtocol = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
+constexpr size_t kNoiseMac = 16;
+constexpr size_t kNoiseMaxFrame = 0xffff;
+using Psk = std::array<uint8_t, 32>;
+
+bool all_zero(const Psk &k) {
+  return std::all_of(k.begin(), k.end(), [](uint8_t b) { return b == 0; });
+}
+
+// Standard base64 (padding optional); true only for exactly 32 decoded bytes.
+bool decode_psk(const std::string &in, Psk *out) {
+  size_t n = 0;
+  uint32_t acc = 0;
+  int bits = 0;
+  for (char ch : in) {
+    int v;
+    if (ch >= 'A' && ch <= 'Z') v = ch - 'A';
+    else if (ch >= 'a' && ch <= 'z') v = ch - 'a' + 26;
+    else if (ch >= '0' && ch <= '9') v = ch - '0' + 52;
+    else if (ch == '+') v = 62;
+    else if (ch == '/') v = 63;
+    else if (ch == '=') break;
+    else return false;
+    acc = (acc << 6) | uint32_t(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (n == out->size()) return false;
+      (*out)[n++] = uint8_t(acc >> bits);
+    }
+  }
+  return n == out->size();
+}
+
+std::string trim(std::string s) {
+  const char *ws = " \t\r\n";
+  s.erase(0, s.find_first_not_of(ws));
+  s.erase(s.find_last_not_of(ws) + 1);
+  return s;
+}
+
+// Atomic replace: a power cut while HA rotates the key must leave either key, never a torn one.
+bool write_file_atomic(const std::string &path, const std::string &data) {
+  std::string tmp = path + ".tmp";
+  int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) return false;
+  bool ok = write(fd, data.data(), data.size()) == ssize_t(data.size()) && fsync(fd) == 0;
+  ok = close(fd) == 0 && ok;
+  if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+    unlink(tmp.c_str());
+    return false;
+  }
+  return true;
+}
+
 // POSIX TZ string for a ParsedTimezone (GetTimeResponse field 3) without DST rules, e.g. "<+0300>-3".
 // std_offset_seconds uses the POSIX sign convention (seconds west of UTC: MSK-3 -> -10800).
 // Returns "" when the zone has DST (not trivially representable here).
@@ -165,6 +230,10 @@ std::string posix_tz_from_parsed(const pb::Field &pf) {
 
 struct ApiServer::Impl {
   struct Client {
+    // Framing is chosen by the first byte the client sends: 0x00 plaintext, 0x01 Noise.
+    enum class Proto : uint8_t { UNKNOWN, PLAIN, NOISE };
+    enum class NoiseStep : uint8_t { CLIENT_HELLO, HANDSHAKE, DATA };
+
     int fd = -1;
     std::string peer;
     std::string rbuf;
@@ -175,11 +244,25 @@ struct ApiServer::Impl {
     bool hello = false;
     bool states = false;
     bool voice = false;
-    bool close_after_flush = false;
+    bool close_after_flush = false;  // also: ignore further input
     int64_t connected_at = 0;
     int64_t last_rx = 0;
     bool ping_outstanding = false;
     int64_t last_time_req = 0;
+    Proto proto = Proto::UNKNOWN;
+    NoiseStep step = NoiseStep::CLIENT_HELLO;
+    NoiseHandshakeState *hs = nullptr;
+    NoiseCipherState *send_cs = nullptr;
+    NoiseCipherState *recv_cs = nullptr;
+
+    Client() = default;
+    Client(const Client &) = delete;
+    Client &operator=(const Client &) = delete;
+    ~Client() {
+      if (hs) noise_handshakestate_free(hs);
+      if (send_cs) noise_cipherstate_free(send_cs);
+      if (recv_cs) noise_cipherstate_free(recv_cs);
+    }
   };
   using ClientPtr = std::shared_ptr<Client>;
 
@@ -189,12 +272,17 @@ struct ApiServer::Impl {
   ApiHooks &hooks;
   int listen_fd = -1;
   // All connections in accept order. A connection counts against kMaxClients only after a valid
-  // HelloRequest, and only then may it evict an established client, so port scanners and
-  // garbage cannot knock Home Assistant off. Iterate over a copy: closing erases from here.
+  // HelloRequest (after the Noise handshake when encrypted), and only then may it evict an
+  // established client, so port scanners and garbage cannot knock Home Assistant off.
+  // Iterate over a copy: closing erases from here.
   std::vector<ClientPtr> clients;
   std::unique_ptr<MdnsResponder> mdns;
   uint64_t tick_timer = 0;
   bool audio_overflowed = false;  // mic audio stopped for this run (backlog)
+  // Without a key Noise sessions run on the all-zeros key: ESPHome's way to let HA provision a
+  // key without sending it in the clear (protects against sniffing only).
+  Psk psk{};
+  bool has_key = false;
 
   // Cached entity state (replayed on SubscribeStatesRequest).
   MediaState media_state = MediaState::IDLE;
@@ -265,22 +353,105 @@ struct ApiServer::Impl {
     loop.add_fd(listen_fd, EPOLLIN, [this](uint32_t) { on_accept(); });
     tick_timer = loop.add_timer(5000, [this] { tick(); }, 5000);
     LOGI("api: listening on :%u as '%s'", cfg.port, id.name.c_str());
+    load_key();
+    mdns.reset(new MdnsResponder(loop, id.name, "_esphomelib._tcp", cfg.port, txt_records()));
+    if (!mdns->start()) LOGW("api: mDNS advertising unavailable");
+    return true;
+  }
 
-    std::string mac_plain;
+  // "aabbccddeeff", as ESPHome puts it in mDNS TXT and the Noise server hello.
+  std::string mac_plain() const {
+    std::string m;
     for (char c : id.mac)
-      if (c != ':') mac_plain.push_back(char(c >= 'A' && c <= 'F' ? c - 'A' + 'a' : c));
+      if (c != ':') m.push_back(char(c >= 'A' && c <= 'F' ? c - 'A' + 'a' : c));
+    return m;
+  }
+
+  std::vector<std::string> txt_records() const {
     std::vector<std::string> txt = {
         "friendly_name=" + id.friendly_name,
         std::string("version=") + kEsphomeVersion,
-        "mac=" + mac_plain,
+        "mac=" + mac_plain(),
         "platform=host",
         "board=cucumber",
         "network=wifi",
         std::string("project_name=") + kProjectName,
         "project_version=" + id.project_version,
     };
-    mdns.reset(new MdnsResponder(loop, id.name, "_esphomelib._tcp", cfg.port, std::move(txt)));
-    if (!mdns->start()) LOGW("api: mDNS advertising unavailable");
+    // HA reads these to ask for a key / offer to provision one before connecting.
+    if (!cfg.key_path.empty())
+      txt.push_back(std::string(has_key ? "api_encryption=" : "api_encryption_supported=") + kNoiseProtocol);
+    return txt;
+  }
+
+  void load_key() {
+    has_key = false;
+    psk.fill(0);
+    if (cfg.key_path.empty()) return;
+    std::string s;
+    if (FILE *f = fopen(cfg.key_path.c_str(), "re")) {
+      char buf[256];
+      size_t n = fread(buf, 1, sizeof buf, f);
+      fclose(f);
+      s = trim(std::string(buf, n));
+    }
+    if (s.empty()) {
+      LOGI("api: no encryption key (%s), plaintext API", cfg.key_path.c_str());
+      return;
+    }
+    Psk k;
+    if (!decode_psk(s, &k)) {
+      // Fail closed: someone meant to enable encryption, so do not fall back to plaintext. A
+      // random key keeps every client out until the file is fixed (or removed).
+      LOGE("api: %s is not base64 of 32 bytes; no client can connect until it is fixed", cfg.key_path.c_str());
+      if (getrandom(psk.data(), psk.size(), 0) != ssize_t(psk.size())) psk.fill(0xa5);
+      has_key = true;
+      return;
+    }
+    if (all_zero(k)) return;
+    psk = k;
+    has_key = true;
+    LOGI("api: Noise encryption enabled");
+  }
+
+  // NoiseEncryptionSetKeyRequest: empty key clears it. Like ESPHome, the reply goes out on the
+  // old session, then every connection is closed so that only clients holding the new key
+  // (or plaintext ones, after a clear) get back in.
+  bool set_key(const std::string &b64) {
+    if (cfg.key_path.empty()) return false;
+    if (b64.empty()) {
+      if (unlink(cfg.key_path.c_str()) != 0 && errno != ENOENT) {
+        LOGW("api: cannot remove %s: %s", cfg.key_path.c_str(), strerror(errno));
+        return false;
+      }
+      LOGI("api: encryption key cleared by client");
+    } else {
+      Psk k;
+      if (!decode_psk(b64, &k) || all_zero(k)) {
+        LOGW("api: rejected encryption key (must be base64 of 32 non-zero bytes)");
+        return false;
+      }
+      if (has_key && k == psk) return true;
+      if (!write_file_atomic(cfg.key_path, b64 + "\n")) {
+        LOGW("api: cannot write %s: %s", cfg.key_path.c_str(), strerror(errno));
+        return false;
+      }
+      LOGI("api: encryption key set by client");
+    }
+    loop.add_timer(100, [this] {
+      load_key();
+      if (mdns) mdns->set_txt("_esphomelib._tcp", txt_records());
+      LOGW("api: encryption key changed, disconnecting all clients");
+      auto snapshot = clients;
+      for (const auto &c : snapshot) {
+        if (c->hello) {
+          c->close_after_flush = true;
+          send_msg(c, DISCONNECT_REQ, pb::Writer());
+        } else {
+          close_client(c, "encryption key changed");
+        }
+      }
+    });
     return true;
   }
 
@@ -396,45 +567,224 @@ struct ApiServer::Impl {
   }
 
   void process(const ClientPtr &c, bool eof) {
+    auto *p = reinterpret_cast<uint8_t *>(c->rbuf.data());
+    const size_t size = c->rbuf.size();
     size_t pos = 0;
-    const auto *p = reinterpret_cast<const uint8_t *>(c->rbuf.data());
-    while (!c->closed && pos < c->rbuf.size()) {
-      size_t avail = c->rbuf.size() - pos;
-      if (p[pos] != 0x00) {
-        close_client(c, p[pos] == 0x01 ? "client requested noise encryption (unsupported)" : "bad frame preamble");
-        return;
-      }
-      size_t q = pos + 1;
-      uint64_t len, type;
-      if (!pb::get_varint(p, c->rbuf.size(), &q, &len) || !pb::get_varint(p, c->rbuf.size(), &q, &type)) {
-        if (avail > 21) {
-          close_client(c, "malformed frame header");
+    while (!c->closed && !c->close_after_flush && pos < size) {
+      if (c->proto == Client::Proto::UNKNOWN) {
+        if (p[pos] == 0x01) {
+          c->proto = Client::Proto::NOISE;
+        } else if (p[pos] == 0x00 && !has_key) {
+          c->proto = Client::Proto::PLAIN;
+        } else if (p[pos] == 0x00) {
+          noise_reject(c, "Bad indicator byte");  // aioesphomeapi: "requires encryption"
+          break;
+        } else {
+          close_client(c, "bad frame preamble");
           return;
         }
-        break;  // header incomplete
       }
-      if (len > kMaxFrame) {
-        close_client(c, "frame too large");
-        return;
-      }
-      if (c->rbuf.size() - q < len) break;  // payload incomplete
-      handle(c, uint32_t(type), p + q, size_t(len));
-      pos = q + size_t(len);
+      size_t used = c->proto == Client::Proto::NOISE ? noise_frame(c, p + pos, size - pos)
+                                                      : plain_frame(c, p + pos, size - pos);
+      if (!used) break;  // incomplete, or the client was closed/rejected
+      pos += used;
     }
     if (c->closed) return;
-    c->rbuf.erase(0, pos);
+    if (c->close_after_flush)
+      c->rbuf.clear();
+    else
+      c->rbuf.erase(0, pos);
     if (eof) close_client(c, "connection closed by peer");
   }
 
-  static void append_frame(Client &c, uint32_t type, const pb::Writer &w) {
+  // Each *_frame returns the bytes consumed, 0 if the frame is incomplete or the client is gone.
+  size_t plain_frame(const ClientPtr &c, const uint8_t *p, size_t n) {
+    if (p[0] != 0x00) {
+      close_client(c, "bad frame preamble");
+      return 0;
+    }
+    size_t q = 1;
+    uint64_t len, type;
+    if (!pb::get_varint(p, n, &q, &len) || !pb::get_varint(p, n, &q, &type)) {
+      if (n > 21) close_client(c, "malformed frame header");
+      return 0;
+    }
+    if (len > kMaxFrame) {
+      close_client(c, "frame too large");
+      return 0;
+    }
+    if (n - q < len) return 0;
+    handle(c, uint32_t(type), p + q, size_t(len));
+    return q + size_t(len);
+  }
+
+  size_t noise_frame(const ClientPtr &c, uint8_t *p, size_t n) {
+    if (p[0] != 0x01) {
+      noise_reject(c, "Bad indicator byte");
+      return 0;
+    }
+    if (n < 3) return 0;
+    size_t len = size_t(p[1]) << 8 | p[2];
+    if (c->step != Client::NoiseStep::DATA && len > 128) {
+      noise_reject(c, "Bad handshake packet len");
+      return 0;
+    }
+    if (n - 3 < len) return 0;
+    uint8_t *body = p + 3;
+    switch (c->step) {
+      case Client::NoiseStep::CLIENT_HELLO: noise_start(c, body, len); break;
+      case Client::NoiseStep::HANDSHAKE: noise_handshake(c, body, len); break;
+      case Client::NoiseStep::DATA: noise_data(c, body, len); break;
+    }
+    return 3 + len;
+  }
+
+  // Client hello (contents reserved, but bound into the handshake via the prologue): answer
+  // with the server hello and prepare the responder side of NNpsk0.
+  void noise_start(const ClientPtr &c, const uint8_t *body, size_t len) {
+    std::string prologue = "NoiseAPIInit";
+    prologue.push_back(char(len >> 8));
+    prologue.push_back(char(len & 0xff));
+    prologue.append(reinterpret_cast<const char *>(body), len);
+    // Chosen protocol 0x01, then node name and MAC: aioesphomeapi checks both against what HA
+    // expects before running the handshake.
+    std::string hello(1, '\x01');
+    hello += id.name;
+    hello.push_back('\0');
+    hello += mac_plain();
+    hello.push_back('\0');
+    append_noise_raw(*c, hello);
+
+    NoiseProtocolId nid{};
+    nid.prefix_id = NOISE_PREFIX_STANDARD;
+    nid.pattern_id = NOISE_PATTERN_NN;
+    nid.modifier_ids[0] = NOISE_MODIFIER_PSK0;
+    nid.dh_id = NOISE_DH_CURVE25519;
+    nid.cipher_id = NOISE_CIPHER_CHACHAPOLY;
+    nid.hash_id = NOISE_HASH_SHA256;
+    int err = noise_handshakestate_new_by_id(&c->hs, &nid, NOISE_ROLE_RESPONDER);
+    if (!err) err = noise_handshakestate_set_pre_shared_key(c->hs, psk.data(), psk.size());
+    if (!err) err = noise_handshakestate_set_prologue(c->hs, prologue.data(), prologue.size());
+    if (!err) err = noise_handshakestate_start(c->hs);
+    if (err) {
+      LOGE("api: noise setup failed (%d)", err);
+      close_client(c, "noise setup failed");
+      return;
+    }
+    c->step = Client::NoiseStep::HANDSHAKE;
+    flush(c);
+  }
+
+  void noise_handshake(const ClientPtr &c, uint8_t *body, size_t len) {
+    if (noise_handshakestate_get_action(c->hs) != NOISE_ACTION_READ_MESSAGE) return noise_reject(c, "Handshake error");
+    if (!len) return noise_reject(c, "Empty handshake message");
+    if (body[0] != 0x00) return noise_reject(c, "Bad handshake error byte");
+    NoiseBuffer in;
+    noise_buffer_set_input(in, body + 1, len - 1);
+    int err = noise_handshakestate_read_message(c->hs, &in, nullptr);
+    if (err) {
+      LOGW("api: %s noise handshake failed: %s", c->peer.c_str(),
+           err == NOISE_ERROR_MAC_FAILURE ? "wrong encryption key" : "protocol error");
+      // The exact "Handshake MAC failure" text makes clients report a wrong key.
+      return noise_reject(c, err == NOISE_ERROR_MAC_FAILURE ? "Handshake MAC failure" : "Handshake error");
+    }
+    if (noise_handshakestate_get_action(c->hs) != NOISE_ACTION_WRITE_MESSAGE) return noise_reject(c, "Handshake error");
+    uint8_t out[128];
+    out[0] = 0x00;
+    NoiseBuffer ob;
+    noise_buffer_set_output(ob, out + 1, sizeof out - 1);
+    err = noise_handshakestate_write_message(c->hs, &ob, nullptr);
+    if (err || noise_handshakestate_get_action(c->hs) != NOISE_ACTION_SPLIT) return noise_reject(c, "Handshake error");
+    append_noise_raw(*c, std::string(reinterpret_cast<const char *>(out), ob.size + 1));
+    err = noise_handshakestate_split(c->hs, &c->send_cs, &c->recv_cs);
+    noise_handshakestate_free(c->hs);
+    c->hs = nullptr;
+    if (err) {
+      close_client(c, "noise split failed");
+      return;
+    }
+    c->step = Client::NoiseStep::DATA;
+    LOGI("api: %s encrypted session (%s)", c->peer.c_str(), has_key ? "device key" : "provisioning key");
+    flush(c);
+  }
+
+  void noise_data(const ClientPtr &c, uint8_t *body, size_t len) {
+    NoiseBuffer mb;
+    noise_buffer_set_inout(mb, body, len, len);
+    if (noise_cipherstate_decrypt(c->recv_cs, &mb) != NOISE_ERROR_NONE) {
+      close_client(c, "noise decrypt failed");
+      return;
+    }
+    if (mb.size < 4) {
+      close_client(c, "short noise message");
+      return;
+    }
+    uint32_t type = uint32_t(body[0]) << 8 | body[1];
+    size_t dlen = size_t(body[2]) << 8 | body[3];
+    if (dlen > mb.size - 4) {
+      close_client(c, "bad noise message length");
+      return;
+    }
+    handle(c, type, body + 4, dlen);
+  }
+
+  // Explicit handshake rejection (status byte 0x01 + reason), then close.
+  void noise_reject(const ClientPtr &c, const char *reason) {
+    LOGI("api: %s rejected: %s", c->peer.c_str(), reason);
+    append_noise_raw(*c, std::string("\x01") + reason);
+    c->close_after_flush = true;
+    flush(c);
+  }
+
+  static void compact(Client &c) {
     if (c.woff && c.woff == c.wbuf.size()) {
       c.wbuf.clear();
       c.woff = 0;
     }
-    c.wbuf.push_back(0);
-    pb::put_varint(c.wbuf, w.size());
-    pb::put_varint(c.wbuf, type);
-    c.wbuf += w.data();
+  }
+
+  static void append_noise_raw(Client &c, const std::string &payload) {
+    compact(c);
+    c.wbuf.push_back(0x01);
+    c.wbuf.push_back(char(payload.size() >> 8));
+    c.wbuf.push_back(char(payload.size() & 0xff));
+    c.wbuf += payload;
+  }
+
+  static void append_frame(Client &c, uint32_t type, const pb::Writer &w) {
+    compact(c);
+    if (c.proto != Client::Proto::NOISE) {
+      c.wbuf.push_back(0);
+      pb::put_varint(c.wbuf, w.size());
+      pb::put_varint(c.wbuf, type);
+      c.wbuf += w.data();
+      return;
+    }
+    if (c.step != Client::NoiseStep::DATA) return;
+    size_t body = 4 + w.size();
+    if (body + kNoiseMac > kNoiseMaxFrame) {
+      LOGE("api: message %u too large for a Noise frame (%zu bytes)", type, w.size());
+      return;
+    }
+    size_t start = c.wbuf.size();
+    c.wbuf.resize(start + 3 + body + kNoiseMac);
+    auto *b = reinterpret_cast<uint8_t *>(c.wbuf.data()) + start;
+    b[3] = uint8_t(type >> 8);
+    b[4] = uint8_t(type);
+    b[5] = uint8_t(w.size() >> 8);
+    b[6] = uint8_t(w.size());
+    memcpy(b + 7, w.data().data(), w.size());
+    NoiseBuffer mb;
+    noise_buffer_set_inout(mb, b + 3, body, body + kNoiseMac);
+    if (noise_cipherstate_encrypt(c.send_cs, &mb) != NOISE_ERROR_NONE) {
+      LOGE("api: noise encrypt failed");
+      c.wbuf.resize(start);
+      return;
+    }
+    b[0] = 0x01;
+    b[1] = uint8_t(mb.size >> 8);
+    b[2] = uint8_t(mb.size);
+    c.wbuf.resize(start + 3 + mb.size);
   }
 
   void send_msg(const ClientPtr &c, uint32_t type, const pb::Writer &w) {
@@ -729,6 +1079,15 @@ struct ApiServer::Impl {
         hooks.on_active_wake_words(ids);
         break;
       }
+      case NOISE_SET_KEY_REQ: {
+        std::string key;
+        while (r.next(f))
+          if (f.num == 1) key = f.str();
+        pb::Writer w;
+        w.boolean(1, set_key(trim(key)));
+        send_msg(c, NOISE_SET_KEY_RESP, w);
+        break;
+      }
       case VA_AUDIO:
         break;  // HA->device TTS audio over API; we do not advertise SPEAKER
       default:
@@ -752,6 +1111,8 @@ struct ApiServer::Impl {
     w.str(12, id.manufacturer, true);
     w.str(13, id.friendly_name, true);
     w.u32(17, kVoiceFeatures);
+    w.boolean(19, !cfg.key_path.empty());              // api_encryption_supported
+    w.boolean(26, !cfg.key_path.empty() && !has_key);  // api_encryption_provisionable
     send_msg(c, DEVICE_INFO_RESP, w);
   }
 

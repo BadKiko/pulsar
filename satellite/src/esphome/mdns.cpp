@@ -138,6 +138,15 @@ void MdnsResponder::add_service(std::string service, std::string instance, uint1
   schedule_announcements();
 }
 
+void MdnsResponder::set_txt(const std::string &service, std::vector<std::string> txt) {
+  for (auto &s : services_) {
+    if (s.type_fqdn != service + ".local") continue;
+    s.txt = std::move(txt);
+    if (fd_ >= 0) schedule_announcements();
+    return;
+  }
+}
+
 void MdnsResponder::schedule_announcements() {
   announce(false);
   timers_.push_back(loop_.add_timer(1000, [this] { announce(false); }));

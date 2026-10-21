@@ -64,7 +64,7 @@ SS_LIBS  := $(SS_BUILD)/sendspin/libsendspin.a \
 # for `addr2line -f -e` on the crash report that main.cpp writes to the log.
 # -Wno-date-time: the build date is reported to Home Assistant as compilation_time.
 CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-date-time -Isrc -I$(SYSROOT)/include \
-            -isystem $(SS_SRC)/sendspin-cpp/include $(SS_DEFS) -fno-omit-frame-pointer -g1
+            -isystem $(SS_SRC)/sendspin-cpp/include -isystem $(SS_SRC)/noise-c/include $(SS_DEFS) -fno-omit-frame-pointer -g1
 LDFLAGS  := -L$(SYSROOT)/lib -Wl,--start-group $(SS_LIBS) -Wl,--end-group -lasound -ldl -lpthread
 
 SRCS := $(shell find src -name '*.cpp')

@@ -28,6 +28,8 @@ class MdnsResponder {
   // Advertises another service on the same host (A record). instance: label without dots, e.g. the
   // host label. May be called before or after start(); after start() it is announced at once.
   void add_service(std::string service, std::string instance, uint16_t port, std::vector<std::string> txt);
+  // Replaces the TXT records of a service added earlier (e.g. "_esphomelib._tcp") and announces it.
+  void set_txt(const std::string &service, std::vector<std::string> txt);
 
  private:
   struct Service {

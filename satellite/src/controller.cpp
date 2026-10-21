@@ -123,6 +123,8 @@ bool Controller::start() {
   if (st_.wake_word != "alisa" && st_.wake_word != "yandex") st_.wake_word = "alisa";
   cfg.active_wake_words = {st_.wake_word};
   cfg.light_effects = {"Rainbow", "Breathe"};
+  const auto slash = state_path_.rfind('/');
+  cfg.key_path = (slash == std::string::npos ? std::string(".") : state_path_.substr(0, slash)) + "/api_key";
   api_ = std::make_unique<ApiServer>(loop_, id, cfg, *this);
 
   // Hardware first: UI feedback should work even if HA is not connected.

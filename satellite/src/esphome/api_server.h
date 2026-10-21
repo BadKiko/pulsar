@@ -135,6 +135,10 @@ struct ApiConfig {
   std::vector<WakeWordInfo> wake_words;          // available on-device wake words
   std::vector<std::string> active_wake_words;     // initially active ids
   std::vector<std::string> light_effects;         // ring light effects, besides "None"
+  // File holding the Noise encryption key (base64 of 32 bytes, as in ESPHome's api: encryption:
+  // key). Missing/empty file: plaintext (and all-zeros-key provisioning). HA may set or rotate it
+  // with NoiseEncryptionSetKeyRequest. Empty path: encryption unsupported.
+  std::string key_path;
 };
 
 class ApiServer {
