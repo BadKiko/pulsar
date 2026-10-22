@@ -47,7 +47,9 @@ sysroot per architecture into `satellite/build/<arch>/sysroot/` (Midi: versioned
 firmware's alsa-lib; Lite 2: unversioned, exporting only `snd_*`, otherwise the daemon would import
 zig's compiler-rt helpers from libasound). Outputs per arch: `pulsar` (stripped, the
 one deployed) and `pulsar.debug` (unstripped, line tables) for `addr2line -f -e` on the
-crash report `main.cpp` writes to the log (non-PIE: addresses are absolute). The version is
+crash report `main.cpp` writes to the log (non-PIE: addresses are absolute; armhf reports pc/lr only:
+glibc's `backtrace()` there runs libgcc_s's unwinder into the binary's static zig personality
+routine and segfaults). The version is
 `git describe --always --dirty` (`--version`, HA DeviceInfo and the "Version" entity). There is no host test
 suite; verification happens on the device.
 
@@ -95,6 +97,16 @@ at 1 MB by `supervise.sh`, one `.1` kept). Boot chain:
 `onboot.sh` (firmware) → `/data/quasar/rootkeeper.sh` → `boot.sh` → waits for quasar, `q stop` →
 `supervise.sh` restart loop while `enabled` exists. `ctl.sh reload` restarts the supervisor itself
 (needed after replacing `supervise.sh`; `install.sh` does it when the script changed).
+
+Migration of pre-rename installs (`/data/cucumber-satellite`, binary `cucumber-satellite`):
+`install.sh` stops the old instance without starting the Yandex stack, copies `state.conf`,
+`api_key` (keeps HA's Noise pairing) and `sendspin/` (MA pairing) into `/data/pulsar` (old binary
+→ `pulsar.prev`), replaces only the old hook line in `rootkeeper.sh` in place (backup
+`rootkeeper.sh.bak-<YYYYMMDDHHMMSS>`), and after the health check passes renames the old dir to
+`/data/cucumber-satellite.migrated-<same ts>` (manual rollback, safe to delete). On failure it
+restores the old hook, `enabled` and supervisor automatically (no rollback prompt). Manual
+rollback: `rm /data/pulsar/enabled && ctl.sh reload` (stops without starting the Yandex stack),
+rename the dir back, swap the hook line back, old `ctl.sh enable`.
 
 Supervisor contract (`supervise.sh` header has the details): daemon exit 0 = deliberate restart
 (SIGTERM from `ctl.sh`, the HA "Restart" button via `on_restart`), restarted after 1 s and not
@@ -177,7 +189,9 @@ through the 32-bit `libquasar_gstreamer.so`, Sendspin playback, LED animations b
 - State persisted in `state.conf` (key=value); add new keys with safe defaults.
 - Comments explain device facts and constraints, not what the code does.
 - ESPHome API: up to 4 clients after a valid hello; states go to all subscribers, the voice
-  pipeline to the latest voice subscriber (`on_voice_subscribed(false/true)` on hand-over).
+  pipeline to the most recent client still subscribed to it: when that one unsubscribes or
+  disconnects, the previous subscriber gets it back (`on_voice_subscribed(false)` then `(true)` on
+  every hand-over), so a probe never leaves HA without the pipeline.
 - `Player::play` done callback: called exactly once per `play()` on the Loop; `true` only if every
   url played to its end; `stop()` or a replacing `play()` delivers `false` for the superseded list
   (queued by that call, so it runs after the caller returns). Callers must check that the dialog /
