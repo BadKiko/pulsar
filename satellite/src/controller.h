@@ -47,6 +47,7 @@ struct Settings {
   std::string update_attempt;
   // zigbee_role=off | pulsar-coordinator | router (ZigbeeService::kRoles)
   ZigbeeService::Mode zigbee_role = ZigbeeService::Mode::OFF;
+  bool zigbee_bridge = true;  // Station 2: EZSP TCP bridge on / off
   // zigbee_flash_failed=<hex>: radio image version given up on (the radio did not take it); not
   // written again until the role changes or another image version is installed.
   uint32_t zigbee_flash_failed = 0;

@@ -101,6 +101,7 @@ bool Settings::load(const std::string &path) {
     else if (k == "led_speed") led_speed = std::isfinite(fv) ? std::clamp(fv, 0.25f, 4.f) : 1.f;
     else if (k == "voice_indication") voice_indication = v == "1";
     else if (k == "led_case_color") led_case_color = v;
+    else if (k == "zigbee_bridge") zigbee_bridge = v != "0";
     else if (k == "led_style") led_style = v == "Custom" ? "Custom" : "Standard";
   }
   const auto &styles = Leds::music_styles();
@@ -125,7 +126,7 @@ void Settings::save(const std::string &path) const {
       << "\nzigbee_role=" << ZigbeeService::role(zigbee_role).name << "\nzigbee_flash_failed=" << std::hex
       << zigbee_flash_failed << std::dec << "\nnearest_answers=" << nearest_answers << "\nmusic_viz=" << music_viz
       << "\nled_speed=" << led_speed << "\nvoice_indication=" << voice_indication
-      << "\nled_case_color=" << led_case_color << "\nled_style=" << led_style << "\n";
+      << "\nled_case_color=" << led_case_color << "\nled_style=" << led_style << "\nzigbee_bridge=" << zigbee_bridge << "\n";
   }
   rename(tmp.c_str(), path.c_str());
 }
@@ -195,6 +196,8 @@ bool Controller::start() {
   cfg.key_path = (slash == std::string::npos ? std::string(".") : state_path_.substr(0, slash)) + "/api_key";
   if (!model_.zigbee_tty.empty())
     for (const auto &r : ZigbeeService::kRoles) cfg.zigbee_modes.push_back(r.label);
+  else if (!model_.ncp_tty.empty())
+    cfg.zigbee_modes = {"Off", "Bridge"};
   api_ = std::make_unique<ApiServer>(loop_, id, cfg, *this);
   arbiter_ok_ = arbiter_.start(id.name);
 
@@ -357,7 +360,10 @@ void Controller::on_client_connected(const std::string &client_info) {
   api_->publish_select(SelectId::MUSIC_VIZ, st_.music_viz);
   api_->publish_select(SelectId::LED_STYLE, st_.led_style);
   api_->publish_select(SelectId::CASE_COLOR, st_.led_case_color.empty() ? "None" : st_.led_case_color);
-  if (ezsp_) api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_->status());
+  if (!model_.ncp_tty.empty()) {
+    api_->publish_select(SelectId::ZIGBEE_MODE, st_.zigbee_bridge ? "Bridge" : "Off");
+    api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_ ? ezsp_->status() : std::string("EZSP bridge off"));
+  }
   if (zigbee_) {
     api_->publish_select(SelectId::ZIGBEE_MODE, ZigbeeService::role(st_.zigbee_role).label);
     api_->publish_text_sensor(TextSensorId::ZIGBEE, zigbee_->status());
@@ -873,6 +879,7 @@ void Controller::start_sendspin(const DeviceIdentity &id) {
 
 void Controller::start_zigbee(const DeviceIdentity &id) {
   if (!model_.ncp_tty.empty()) {  // Silicon Labs NCP: plain TCP serial port for Z2M / ZHA
+    if (!st_.zigbee_bridge) return;
     ezsp_ = std::make_unique<EzspBridge>(loop_, model_.ncp_tty, model_.ncp_baud, kZigbeePort, [this] {
       LOGI("zigbee: %s", ezsp_->status().c_str());
       api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_->status());
@@ -1215,6 +1222,16 @@ void Controller::on_text(TextId id, const std::string &value) {
 
 void Controller::on_select(SelectId id, const std::string &option) {
   if (id == SelectId::ZIGBEE_MODE) {
+    if (!model_.ncp_tty.empty()) {  // Station 2: the bridge is started with the daemon
+      const bool on = option == "Bridge";
+      api_->publish_select(id, on ? "Bridge" : "Off");
+      if (on == st_.zigbee_bridge) return;
+      LOGW("zigbee: EZSP bridge %s, restarting", on ? "on" : "off");
+      st_.zigbee_bridge = on;
+      persist();
+      loop_.stop();
+      return;
+    }
     if (!zigbee_) return;
     auto role = st_.zigbee_role;
     for (const auto &r : ZigbeeService::kRoles)
@@ -1262,6 +1279,14 @@ void Controller::on_select(SelectId id, const std::string &option) {
 }
 
 void Controller::on_button(ButtonId id) {
+  if (!model_.ncp_tty.empty()) {  // the network is run by Zigbee2MQTT / ZHA through the bridge
+    LOGI("zigbee: join/leave are done in Zigbee2MQTT / ZHA (EZSP bridge)");
+    api_->publish_text_sensor(TextSensorId::ZIGBEE, "Join/leave: use Zigbee2MQTT or ZHA");
+    loop_.add_timer(6000, [this] {
+      api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_ ? ezsp_->status() : std::string("EZSP bridge off"));
+    });
+    return;
+  }
   if (!zigbee_) return;
   if (zigbee_->mode() != ZigbeeService::Mode::ROUTER) {
     LOGW("zigbee: join/leave only apply to the router role");
