@@ -40,6 +40,7 @@ struct Settings {
   float led_speed = 1;             // 0.25..4
   bool voice_indication = true;    // listening / thinking / speaking shown on the ring
   std::string led_case_color;      // stem of Leds::case_colors(), "" = none
+  std::string led_style = "Standard";  // Station 2: "Standard" (Yandex patterns) / "Custom"
   // Release being installed. Still set after a restart into another version: that release was
   // rolled back by supervise.sh (crash loop), automatic updates skip it.
   std::string update_attempt;

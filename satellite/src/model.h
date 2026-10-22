@@ -58,6 +58,9 @@ struct Model {
   // (active low, 1 = asserted) exported by the kernel's zb_control driver. zigbee_tty empty: none.
   std::string zigbee_tty;
   std::string zigbee_reset, zigbee_boot;
+
+  // 2-D LED panel (Station 2): stock patterns and panel effects instead of ring ones.
+  bool panel = false;
 };
 
 // The detected model; nullptr on unsupported hardware.

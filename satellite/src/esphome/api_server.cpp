@@ -130,6 +130,7 @@ enum Key : uint32_t {
   K_SW_VOICE_INDICATION = 28,
   K_SELECT_CASE_COLOR = 29,
   K_ACTION_LED_SHOW = 30,
+  K_SELECT_LED_STYLE = 31,
 };
 
 // aioesphomeapi VoiceAssistantFeature bits.
@@ -370,7 +371,7 @@ struct ApiServer::Impl {
   UpdateState update;
   bool update_has = false;
   FloatState lux, clock_bri, clock_scroll, led_speed;
-  StrState clock_text, clock_face, zigbee_mode, zigbee_status, music_viz, case_color;
+  StrState clock_text, clock_face, zigbee_mode, zigbee_status, music_viz, case_color, led_style;
   LightState light;
   // Diagnostics, refreshed by diag_timer.
   FloatState rssi;
@@ -1329,7 +1330,7 @@ struct ApiServer::Impl {
       send_msg(c, LIST_SWITCH, w);
     };
     sw("mute_microphones", K_SW_MIC_MUTE, "Mute microphones", "mdi:microphone-off");
-    sw("clock_display", K_SW_CLOCK, "Clock display", "mdi:clock-digital");
+    if (cfg.has_clock) sw("clock_display", K_SW_CLOCK, "Clock display", "mdi:clock-digital");
     {
       pb::Writer w;
       entity_head(w, "auto_update", K_SW_AUTO_UPDATE, "Auto update");
@@ -1374,7 +1375,10 @@ struct ApiServer::Impl {
     };
     select_entity("music_visualization", K_SELECT_MUSIC_VIZ, "Music visualization", "mdi:equalizer",
                   cfg.music_styles);
-    select_entity("case_color", K_SELECT_CASE_COLOR, "Case color", "mdi:palette", cfg.case_colors);
+    if (cfg.has_case_color)
+      select_entity("case_color", K_SELECT_CASE_COLOR, "Case color", "mdi:palette", cfg.case_colors);
+    if (!cfg.led_styles.empty())
+      select_entity("led_style", K_SELECT_LED_STYLE, "LED style", "mdi:led-strip-variant", cfg.led_styles);
     {
       pb::Writer w;
       entity_head(w, "firmware", K_UPDATE, "Firmware");
@@ -1398,7 +1402,7 @@ struct ApiServer::Impl {
       w.u32(10, STATE_CLASS_MEASUREMENT);
       send_msg(c, LIST_SENSOR, w);
     }
-    {
+    if (cfg.has_clock) {
       pb::Writer w;
       entity_head(w, "clock_brightness", K_NUMBER_CLOCK_BRI, "Clock brightness");
       w.str(5, "mdi:brightness-6");
@@ -1461,7 +1465,7 @@ struct ApiServer::Impl {
     };
     text("ip_address", K_TEXT_IP, "IP address", "mdi:ip-network");
     text("version", K_TEXT_VERSION, "Version", "mdi:new-box");
-    {
+    if (cfg.has_clock) {
       pb::Writer w;
       entity_head(w, "clock_text_speed", K_NUMBER_CLOCK_SCROLL, "Clock text speed");
       w.str(5, "mdi:speedometer");
@@ -1473,14 +1477,14 @@ struct ApiServer::Impl {
       w.u32(12, NUMBER_MODE_SLIDER);
       send_msg(c, LIST_NUMBER, w);
     }
-    {
+    if (cfg.has_clock) {
       pb::Writer w;
       entity_head(w, "clock_text", K_TEXT_CLOCK, "Clock text");
       w.str(5, "mdi:form-textbox");
       w.u32(9, kClockTextMax);  // max_length
       send_msg(c, LIST_TEXT, w);
     }
-    {
+    if (cfg.has_clock) {
       pb::Writer w;
       entity_head(w, "clock_face", K_SELECT_CLOCK_FACE, "Clock face");
       w.str(5, "mdi:emoticon-outline");
@@ -1513,8 +1517,8 @@ struct ApiServer::Impl {
       }
       send_msg(c, LIST_SERVICES, w);
     };
-    action("clock_show_text", K_ACTION_CLOCK_TEXT, {{"text", SERVICE_ARG_STRING}, {"seconds", SERVICE_ARG_INT}});
-    action("clock_show_face", K_ACTION_CLOCK_FACE, {{"face", SERVICE_ARG_STRING}, {"seconds", SERVICE_ARG_INT}});
+    if (cfg.has_clock) action("clock_show_text", K_ACTION_CLOCK_TEXT, {{"text", SERVICE_ARG_STRING}, {"seconds", SERVICE_ARG_INT}});
+    if (cfg.has_clock) action("clock_show_face", K_ACTION_CLOCK_FACE, {{"face", SERVICE_ARG_STRING}, {"seconds", SERVICE_ARG_INT}});
     action("led_show", K_ACTION_LED_SHOW,
            {{"effect", SERVICE_ARG_STRING}, {"color", SERVICE_ARG_STRING}, {"seconds", SERVICE_ARG_INT}});
     send_msg(c, LIST_DONE, pb::Writer());
@@ -1578,26 +1582,29 @@ struct ApiServer::Impl {
   void send_all_states(const ClientPtr &c) {
     send_media(c);
     send_switch(K_SW_MIC_MUTE, sw_mic_mute, c);
-    send_switch(K_SW_CLOCK, sw_clock, c);
+    if (cfg.has_clock) send_switch(K_SW_CLOCK, sw_clock, c);
     send_switch(K_SW_AUTO_UPDATE, sw_auto_update, c);
     send_switch(K_SW_NEAREST_ANSWERS, sw_nearest_answers, c);
     send_switch(K_SW_VOICE_INDICATION, sw_voice_indication, c);
     send_update(c);
     send_binary(K_BS_HW_MIC_MUTE, bs_hw_mute, c);
     send_float(SENSOR_STATE, K_SENSOR_LUX, lux, c);
-    send_float(NUMBER_STATE, K_NUMBER_CLOCK_BRI, clock_bri, c);
+    if (cfg.has_clock) send_float(NUMBER_STATE, K_NUMBER_CLOCK_BRI, clock_bri, c);
     send_light(c);
     refresh_diagnostics(false);
     send_float(SENSOR_STATE, K_SENSOR_RSSI, rssi, c);
     send_uptime(c);
     send_ip(c);
     send_str(TEXT_SENSOR_STATE, K_TEXT_VERSION, id.project_version, true, c);
-    send_float(NUMBER_STATE, K_NUMBER_CLOCK_SCROLL, clock_scroll, c);
-    send_str(TEXT_STATE, K_TEXT_CLOCK, clock_text.v, clock_text.has, c);
-    send_str(SELECT_STATE, K_SELECT_CLOCK_FACE, clock_face.v, clock_face.has, c);
+    if (cfg.has_clock) {
+      send_float(NUMBER_STATE, K_NUMBER_CLOCK_SCROLL, clock_scroll, c);
+      send_str(TEXT_STATE, K_TEXT_CLOCK, clock_text.v, clock_text.has, c);
+      send_str(SELECT_STATE, K_SELECT_CLOCK_FACE, clock_face.v, clock_face.has, c);
+    }
     send_float(NUMBER_STATE, K_NUMBER_LED_SPEED, led_speed, c);
     send_str(SELECT_STATE, K_SELECT_MUSIC_VIZ, music_viz.v, music_viz.has, c);
-    send_str(SELECT_STATE, K_SELECT_CASE_COLOR, case_color.v, case_color.has, c);
+    if (cfg.has_case_color) send_str(SELECT_STATE, K_SELECT_CASE_COLOR, case_color.v, case_color.has, c);
+    if (!cfg.led_styles.empty()) send_str(SELECT_STATE, K_SELECT_LED_STYLE, led_style.v, led_style.has, c);
     if (!cfg.zigbee_modes.empty()) {
       send_str(SELECT_STATE, K_SELECT_ZIGBEE_MODE, zigbee_mode.v, zigbee_mode.has, c);
       send_str(TEXT_SENSOR_STATE, K_TEXT_ZIGBEE, zigbee_status.v, zigbee_status.has, c);
@@ -1744,6 +1751,12 @@ struct ApiServer::Impl {
       for (const auto &o : cfg.zigbee_modes)
         if (o == s) return hooks.on_select(SelectId::ZIGBEE_MODE, s);
       LOGW("api: unknown Zigbee role '%s'", s.c_str());
+      return;
+    }
+    if (key == K_SELECT_LED_STYLE) {
+      for (const auto &o : cfg.led_styles)
+        if (o == s) return hooks.on_select(SelectId::LED_STYLE, s);
+      LOGW("api: unknown LED style '%s'", s.c_str());
       return;
     }
     if (key == K_SELECT_MUSIC_VIZ || key == K_SELECT_CASE_COLOR) {
@@ -2005,6 +2018,7 @@ void ApiServer::publish_select(SelectId id, const std::string &state) {
     case SelectId::ZIGBEE_MODE: s = &impl_->zigbee_mode; key = K_SELECT_ZIGBEE_MODE; break;
     case SelectId::MUSIC_VIZ: s = &impl_->music_viz; key = K_SELECT_MUSIC_VIZ; break;
     case SelectId::CASE_COLOR: s = &impl_->case_color; key = K_SELECT_CASE_COLOR; break;
+    case SelectId::LED_STYLE: s = &impl_->led_style; key = K_SELECT_LED_STYLE; break;
   }
   if (!s) return;
   *s = {true, state};

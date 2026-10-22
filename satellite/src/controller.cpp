@@ -101,6 +101,7 @@ bool Settings::load(const std::string &path) {
     else if (k == "led_speed") led_speed = std::isfinite(fv) ? std::clamp(fv, 0.25f, 4.f) : 1.f;
     else if (k == "voice_indication") voice_indication = v == "1";
     else if (k == "led_case_color") led_case_color = v;
+    else if (k == "led_style") led_style = v == "Custom" ? "Custom" : "Standard";
   }
   const auto &styles = Leds::music_styles();
   if (std::find(styles.begin(), styles.end(), music_viz) == styles.end()) music_viz = "All styles";
@@ -124,7 +125,7 @@ void Settings::save(const std::string &path) const {
       << "\nzigbee_role=" << ZigbeeService::role(zigbee_role).name << "\nzigbee_flash_failed=" << std::hex
       << zigbee_flash_failed << std::dec << "\nnearest_answers=" << nearest_answers << "\nmusic_viz=" << music_viz
       << "\nled_speed=" << led_speed << "\nvoice_indication=" << voice_indication
-      << "\nled_case_color=" << led_case_color << "\n";
+      << "\nled_case_color=" << led_case_color << "\nled_style=" << led_style << "\n";
   }
   rename(tmp.c_str(), path.c_str());
 }
@@ -176,6 +177,13 @@ bool Controller::start() {
   if (st_.wake_word != "alisa" && st_.wake_word != "yandex") st_.wake_word = "alisa";
   cfg.active_wake_words = {st_.wake_word};
   cfg.light_effects = Leds::effect_names();
+  if (model_.panel) {
+    const auto &pe = Leds::panel_effect_names();
+    cfg.light_effects.insert(cfg.light_effects.end(), pe.begin(), pe.end());
+    cfg.led_styles = {"Standard", "Custom"};
+    cfg.has_clock = false;
+    cfg.has_case_color = false;
+  }
   cfg.music_styles = Leds::music_styles();
   cfg.case_colors = {"None"};
   const auto case_colors = Leds::case_colors();
@@ -198,6 +206,7 @@ bool Controller::start() {
   leds_.set_speed(st_.led_speed);
   leds_.set_voice_indication(st_.voice_indication);
   leds_.set_music_style(st_.music_viz);
+  leds_.set_stock_style(st_.led_style != "Custom");
   leds_.set_user_light(st_.light.on,
                        Rgb{uint8_t(st_.light.r * 255), uint8_t(st_.light.g * 255), uint8_t(st_.light.b * 255)},
                        st_.light.brightness, st_.light.effect, 0);
@@ -345,6 +354,7 @@ void Controller::on_client_connected(const std::string &client_info) {
   api_->publish_select(SelectId::CLOCK_FACE, clock_face_);
   api_->publish_number(NumberId::LED_SPEED, st_.led_speed);
   api_->publish_select(SelectId::MUSIC_VIZ, st_.music_viz);
+  api_->publish_select(SelectId::LED_STYLE, st_.led_style);
   api_->publish_select(SelectId::CASE_COLOR, st_.led_case_color.empty() ? "None" : st_.led_case_color);
   if (zigbee_) {
     api_->publish_select(SelectId::ZIGBEE_MODE, ZigbeeService::role(st_.zigbee_role).label);
@@ -1214,6 +1224,13 @@ void Controller::on_select(SelectId id, const std::string &option) {
     api_->publish_select(id, option);
     persist();
     update_music();
+    return;
+  }
+  if (id == SelectId::LED_STYLE) {
+    st_.led_style = option == "Custom" ? "Custom" : "Standard";
+    leds_.set_stock_style(st_.led_style != "Custom");
+    api_->publish_select(id, st_.led_style);
+    persist();
     return;
   }
   if (id == SelectId::CASE_COLOR) {
