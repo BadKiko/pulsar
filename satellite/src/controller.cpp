@@ -103,6 +103,7 @@ bool Settings::load(const std::string &path) {
     else if (k == "led_case_color") led_case_color = v;
     else if (k == "zigbee_ncp") zigbee_ncp = (v == "off" || v == "bridge") ? v : "router";
     else if (k == "quick_commands") quick_commands = (v == "always" || v == "off") ? v : "playing";
+    else if (k == "bt_type") bt_type = v == "Speaker" ? "Speaker" : "Headphones";
     else if (k == "led_style") led_style = v == "Custom" ? "Custom" : "Standard";
   }
   const auto &styles = Leds::music_styles();
@@ -127,7 +128,7 @@ void Settings::save(const std::string &path) const {
       << "\nzigbee_role=" << ZigbeeService::role(zigbee_role).name << "\nzigbee_flash_failed=" << std::hex
       << zigbee_flash_failed << std::dec << "\nnearest_answers=" << nearest_answers << "\nmusic_viz=" << music_viz
       << "\nled_speed=" << led_speed << "\nvoice_indication=" << voice_indication
-      << "\nled_case_color=" << led_case_color << "\nquick_commands=" << quick_commands << "\nled_style=" << led_style << "\nzigbee_ncp=" << zigbee_ncp << "\n";
+      << "\nled_case_color=" << led_case_color << "\nquick_commands=" << quick_commands << "\nbt_type=" << bt_type << "\nled_style=" << led_style << "\nzigbee_ncp=" << zigbee_ncp << "\n";
   }
   rename(tmp.c_str(), path.c_str());
 }
@@ -181,6 +182,7 @@ bool Controller::start() {
   cfg.light_effects = Leds::effect_names();
   cfg.quick_commands = {"While playing", "Always", "Off"};
   cfg.has_bluetooth = model_.bluetooth;
+  if (model_.bluetooth) cfg.bluetooth_types = {"Headphones", "Speaker"};
   cfg.zigbee_status = !model_.ncp_tty.empty();
   if (model_.panel) {
     const auto &pe = Leds::panel_effect_names();
@@ -338,6 +340,7 @@ bool Controller::start() {
       leds_.set_bluetooth(bt_->pairing());
       api_->publish_switch(SwitchId::BLUETOOTH, bt_->pairing());
     });
+    bt_->set_headphones(st_.bt_type != "Speaker");
     bt_->start();
   }
   update_ui();
@@ -370,7 +373,10 @@ void Controller::on_client_connected(const std::string &client_info) {
   api_->publish_select(SelectId::MUSIC_VIZ, st_.music_viz);
   api_->publish_select(SelectId::QUICK_COMMANDS,
                        st_.quick_commands == "always" ? "Always" : st_.quick_commands == "off" ? "Off" : "While playing");
-  if (bt_) api_->publish_switch(SwitchId::BLUETOOTH, bt_->pairing());
+  if (bt_) {
+    api_->publish_switch(SwitchId::BLUETOOTH, bt_->pairing());
+    api_->publish_select(SelectId::BLUETOOTH_TYPE, st_.bt_type);
+  }
   api_->publish_select(SelectId::LED_STYLE, st_.led_style);
   api_->publish_select(SelectId::CASE_COLOR, st_.led_case_color.empty() ? "None" : st_.led_case_color);
   if (!model_.ncp_tty.empty()) {
@@ -1287,6 +1293,13 @@ void Controller::on_select(SelectId id, const std::string &option) {
     api_->publish_select(id, option);
     persist();
     update_music();
+    return;
+  }
+  if (id == SelectId::BLUETOOTH_TYPE) {
+    st_.bt_type = option == "Speaker" ? "Speaker" : "Headphones";
+    if (bt_) bt_->set_headphones(st_.bt_type != "Speaker");
+    api_->publish_select(id, st_.bt_type);
+    persist();
     return;
   }
   if (id == SelectId::QUICK_COMMANDS) {

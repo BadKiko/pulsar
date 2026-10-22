@@ -26,6 +26,8 @@ class Bluetooth {
   // on: discoverable + pairable for 3 minutes; off: closes the window and disconnects the phones.
   void set_pairing(bool on);
   bool pairing() const;
+  // Device class shown to phones / PCs: headphones (default: listed with the audio outputs) or speaker.
+  void set_headphones(bool on);
 
  private:
   void run();
@@ -36,7 +38,8 @@ class Bluetooth {
   std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
   mutable std::mutex mu_;
   std::condition_variable cv_;
-  int want_ = -1;  // -1 nothing, 0 off, 1 on
+  int want_ = -1;  // -1 nothing, 0 off, 1 on, 3 only apply the device class
+  std::atomic<bool> headphones_{true};
   bool stop_ = false, pairing_ = false;
   std::thread th_;
 };

@@ -17,6 +17,11 @@ constexpr const char *kOn =
 constexpr const char *kOff =
     "bluetoothctl discoverable off; bluetoothctl pairable off; "
     "for m in $(bluetoothctl devices Connected | cut -d' ' -f2); do bluetoothctl disconnect $m; done";
+// bluetoothd resets the class on its own now and then (main.conf: loudspeaker), so it is set again
+// with every window; paired devices are trusted so that they reconnect without a new pairing.
+constexpr const char *kTrust = "for m in $(bluetoothctl devices Paired | cut -d' ' -f2); do bluetoothctl trust $m; done";
+constexpr const char *kClassHeadphones = "hciconfig hci0 class 0x4c0418";  // Audio/Video, headphones
+constexpr const char *kClassSpeaker = "hciconfig hci0 class 0x4c0414";     // Audio/Video, loudspeaker
 constexpr const char *kExpired = "bluetoothctl pairable off";  // window timed out: no more new pairings
 
 }  // namespace
@@ -31,6 +36,15 @@ Bluetooth::~Bluetooth() {
   }
   cv_.notify_all();
   if (th_.joinable()) th_.join();
+}
+
+void Bluetooth::set_headphones(bool on) {
+  headphones_ = on;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (want_ < 0) want_ = 3;  // a pending on / off sets the class itself
+  }
+  cv_.notify_all();
 }
 
 void Bluetooth::start() { th_ = std::thread([this] { run(); }); }
@@ -69,12 +83,20 @@ void Bluetooth::run() {
     const int want = want_;
     want_ = -1;
     lk.unlock();
-    if (want == 1) {
+    const char *cls = headphones_ ? kClassHeadphones : kClassSpeaker;
+    if (want == 3) {
+      system(cls);
+    } else if (want == 1) {
+      system(cls);
       if (system(kOn) != 0) LOGW("bluetooth: bluetoothctl failed");
     } else if (want == 0) {
       if (system(kOff) != 0) LOGW("bluetooth: bluetoothctl failed");
     }
     const bool now = query_discoverable();
+    if (now) {
+      system(cls);
+      system(kTrust);
+    }
     lk.lock();
     const bool was = pairing_;
     pairing_ = now;

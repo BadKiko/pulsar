@@ -134,6 +134,7 @@ enum Key : uint32_t {
   K_SW_BLUETOOTH = 32,
   K_SELECT_QUICK_COMMANDS = 33,
   K_EVENT_VOICE_COMMAND = 34,
+  K_SELECT_BT_TYPE = 35,
 };
 
 // aioesphomeapi VoiceAssistantFeature bits.
@@ -374,7 +375,7 @@ struct ApiServer::Impl {
   UpdateState update;
   bool update_has = false;
   FloatState lux, clock_bri, clock_scroll, led_speed;
-  StrState clock_text, clock_face, zigbee_mode, zigbee_status, music_viz, case_color, led_style, quick_commands;
+  StrState clock_text, clock_face, zigbee_mode, zigbee_status, music_viz, case_color, led_style, quick_commands, bt_type;
   LightState light;
   // Diagnostics, refreshed by diag_timer.
   FloatState rssi;
@@ -1386,6 +1387,8 @@ struct ApiServer::Impl {
                   cfg.music_styles);
     if (cfg.has_case_color)
       select_entity("case_color", K_SELECT_CASE_COLOR, "Case color", "mdi:palette", cfg.case_colors);
+    if (!cfg.bluetooth_types.empty())
+      select_entity("bluetooth_type", K_SELECT_BT_TYPE, "Bluetooth type", "mdi:headphones", cfg.bluetooth_types);
     if (!cfg.quick_commands.empty())
       select_entity("quick_commands", K_SELECT_QUICK_COMMANDS, "Quick commands", "mdi:microphone-message",
                     cfg.quick_commands);
@@ -1624,6 +1627,7 @@ struct ApiServer::Impl {
     send_float(NUMBER_STATE, K_NUMBER_LED_SPEED, led_speed, c);
     send_str(SELECT_STATE, K_SELECT_MUSIC_VIZ, music_viz.v, music_viz.has, c);
     if (cfg.has_case_color) send_str(SELECT_STATE, K_SELECT_CASE_COLOR, case_color.v, case_color.has, c);
+    if (!cfg.bluetooth_types.empty()) send_str(SELECT_STATE, K_SELECT_BT_TYPE, bt_type.v, bt_type.has, c);
     if (!cfg.quick_commands.empty())
       send_str(SELECT_STATE, K_SELECT_QUICK_COMMANDS, quick_commands.v, quick_commands.has, c);
     if (!cfg.led_styles.empty()) send_str(SELECT_STATE, K_SELECT_LED_STYLE, led_style.v, led_style.has, c);
@@ -1776,6 +1780,11 @@ struct ApiServer::Impl {
       for (const auto &o : cfg.zigbee_modes)
         if (o == s) return hooks.on_select(SelectId::ZIGBEE_MODE, s);
       LOGW("api: unknown Zigbee role '%s'", s.c_str());
+      return;
+    }
+    if (key == K_SELECT_BT_TYPE) {
+      for (const auto &o : cfg.bluetooth_types)
+        if (o == s) return hooks.on_select(SelectId::BLUETOOTH_TYPE, s);
       return;
     }
     if (key == K_SELECT_QUICK_COMMANDS) {
@@ -2051,6 +2060,7 @@ void ApiServer::publish_select(SelectId id, const std::string &state) {
     case SelectId::MUSIC_VIZ: s = &impl_->music_viz; key = K_SELECT_MUSIC_VIZ; break;
     case SelectId::CASE_COLOR: s = &impl_->case_color; key = K_SELECT_CASE_COLOR; break;
     case SelectId::LED_STYLE: s = &impl_->led_style; key = K_SELECT_LED_STYLE; break;
+    case SelectId::BLUETOOTH_TYPE: s = &impl_->bt_type; key = K_SELECT_BT_TYPE; break;
     case SelectId::QUICK_COMMANDS: s = &impl_->quick_commands; key = K_SELECT_QUICK_COMMANDS; break;
   }
   if (!s) return;
