@@ -16,6 +16,7 @@
 #include "sendspin/sendspin_service.h"
 #include "update/updater.h"
 #include "zigbee/ezsp_bridge.h"
+#include "zigbee/ezsp_router.h"
 #include "zigbee/service.h"
 
 namespace cs {
@@ -47,7 +48,7 @@ struct Settings {
   std::string update_attempt;
   // zigbee_role=off | pulsar-coordinator | router (ZigbeeService::kRoles)
   ZigbeeService::Mode zigbee_role = ZigbeeService::Mode::OFF;
-  bool zigbee_bridge = true;  // Station 2: EZSP TCP bridge on / off
+  std::string zigbee_ncp = "router";  // Station 2 radio: off | bridge (TCP serial port) | router
   // zigbee_flash_failed=<hex>: radio image version given up on (the radio did not take it); not
   // written again until the role changes or another image version is installed.
   uint32_t zigbee_flash_failed = 0;
@@ -205,6 +206,9 @@ class Controller : public ApiHooks {
   // Zigbee radio (Midi): coordinator for ZHA or router in another network.
   std::unique_ptr<ZigbeeService> zigbee_;
   std::unique_ptr<EzspBridge> ezsp_;
+  std::unique_ptr<EzspRouter> ezsp_router_;
+  std::string ncp_status() const;
+  const char *ncp_label() const;
   std::string zigbee_status_;  // last status line published
   // Sendspin (Music Assistant) player; declared last so it stops (and stops calling back into
   // the members above) first.

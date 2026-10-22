@@ -101,7 +101,7 @@ bool Settings::load(const std::string &path) {
     else if (k == "led_speed") led_speed = std::isfinite(fv) ? std::clamp(fv, 0.25f, 4.f) : 1.f;
     else if (k == "voice_indication") voice_indication = v == "1";
     else if (k == "led_case_color") led_case_color = v;
-    else if (k == "zigbee_bridge") zigbee_bridge = v != "0";
+    else if (k == "zigbee_ncp") zigbee_ncp = (v == "off" || v == "bridge") ? v : "router";
     else if (k == "led_style") led_style = v == "Custom" ? "Custom" : "Standard";
   }
   const auto &styles = Leds::music_styles();
@@ -126,7 +126,7 @@ void Settings::save(const std::string &path) const {
       << "\nzigbee_role=" << ZigbeeService::role(zigbee_role).name << "\nzigbee_flash_failed=" << std::hex
       << zigbee_flash_failed << std::dec << "\nnearest_answers=" << nearest_answers << "\nmusic_viz=" << music_viz
       << "\nled_speed=" << led_speed << "\nvoice_indication=" << voice_indication
-      << "\nled_case_color=" << led_case_color << "\nled_style=" << led_style << "\nzigbee_bridge=" << zigbee_bridge << "\n";
+      << "\nled_case_color=" << led_case_color << "\nled_style=" << led_style << "\nzigbee_ncp=" << zigbee_ncp << "\n";
   }
   rename(tmp.c_str(), path.c_str());
 }
@@ -197,7 +197,7 @@ bool Controller::start() {
   if (!model_.zigbee_tty.empty())
     for (const auto &r : ZigbeeService::kRoles) cfg.zigbee_modes.push_back(r.label);
   else if (!model_.ncp_tty.empty())
-    cfg.zigbee_modes = {"Off", "Bridge"};
+    cfg.zigbee_modes = {"Off", "Bridge", "Router"};
   api_ = std::make_unique<ApiServer>(loop_, id, cfg, *this);
   arbiter_ok_ = arbiter_.start(id.name);
 
@@ -361,8 +361,8 @@ void Controller::on_client_connected(const std::string &client_info) {
   api_->publish_select(SelectId::LED_STYLE, st_.led_style);
   api_->publish_select(SelectId::CASE_COLOR, st_.led_case_color.empty() ? "None" : st_.led_case_color);
   if (!model_.ncp_tty.empty()) {
-    api_->publish_select(SelectId::ZIGBEE_MODE, st_.zigbee_bridge ? "Bridge" : "Off");
-    api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_ ? ezsp_->status() : std::string("EZSP bridge off"));
+    api_->publish_select(SelectId::ZIGBEE_MODE, ncp_label());
+    api_->publish_text_sensor(TextSensorId::ZIGBEE, ncp_status());
   }
   if (zigbee_) {
     api_->publish_select(SelectId::ZIGBEE_MODE, ZigbeeService::role(st_.zigbee_role).label);
@@ -877,9 +877,27 @@ void Controller::start_sendspin(const DeviceIdentity &id) {
   }
 }
 
+std::string Controller::ncp_status() const {
+  if (ezsp_router_) return ezsp_router_->status();
+  if (ezsp_) return ezsp_->status();
+  return "Radio off";
+}
+
+const char *Controller::ncp_label() const {
+  return st_.zigbee_ncp == "bridge" ? "Bridge" : st_.zigbee_ncp == "router" ? "Router" : "Off";
+}
+
 void Controller::start_zigbee(const DeviceIdentity &id) {
   if (!model_.ncp_tty.empty()) {  // Silicon Labs NCP: plain TCP serial port for Z2M / ZHA
-    if (!st_.zigbee_bridge) return;
+    if (st_.zigbee_ncp == "router") {  // joins the Zigbee2MQTT / ZHA network and repeats its frames
+      ezsp_router_ = std::make_unique<EzspRouter>(loop_, model_.ncp_tty, model_.ncp_baud, [this] {
+        LOGI("zigbee: %s", ezsp_router_->status().c_str());
+        api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_router_->status());
+      });
+      ezsp_router_->start();
+      return;
+    }
+    if (st_.zigbee_ncp != "bridge") return;
     ezsp_ = std::make_unique<EzspBridge>(loop_, model_.ncp_tty, model_.ncp_baud, kZigbeePort, [this] {
       LOGI("zigbee: %s", ezsp_->status().c_str());
       api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_->status());
@@ -1223,11 +1241,11 @@ void Controller::on_text(TextId id, const std::string &value) {
 void Controller::on_select(SelectId id, const std::string &option) {
   if (id == SelectId::ZIGBEE_MODE) {
     if (!model_.ncp_tty.empty()) {  // Station 2: the bridge is started with the daemon
-      const bool on = option == "Bridge";
-      api_->publish_select(id, on ? "Bridge" : "Off");
-      if (on == st_.zigbee_bridge) return;
-      LOGW("zigbee: EZSP bridge %s, restarting", on ? "on" : "off");
-      st_.zigbee_bridge = on;
+      const std::string mode = option == "Bridge" ? "bridge" : option == "Router" ? "router" : "off";
+      if (mode == st_.zigbee_ncp) return api_->publish_select(id, ncp_label());
+      LOGW("zigbee: radio mode %s chosen, restarting", mode.c_str());
+      st_.zigbee_ncp = mode;
+      api_->publish_select(id, ncp_label());
       persist();
       loop_.stop();
       return;
@@ -1279,12 +1297,15 @@ void Controller::on_select(SelectId id, const std::string &option) {
 }
 
 void Controller::on_button(ButtonId id) {
-  if (!model_.ncp_tty.empty()) {  // the network is run by Zigbee2MQTT / ZHA through the bridge
-    LOGI("zigbee: join/leave are done in Zigbee2MQTT / ZHA (EZSP bridge)");
-    api_->publish_text_sensor(TextSensorId::ZIGBEE, "Join/leave: use Zigbee2MQTT or ZHA");
-    loop_.add_timer(6000, [this] {
-      api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_ ? ezsp_->status() : std::string("EZSP bridge off"));
-    });
+  if (!model_.ncp_tty.empty()) {
+    if (ezsp_router_) {  // router role: open permit join in Zigbee2MQTT / ZHA, then press join
+      if (id == ButtonId::ZIGBEE_JOIN) ezsp_router_->join();
+      else ezsp_router_->leave();
+      return;
+    }
+    LOGI("zigbee: join/leave only apply to the router role");
+    api_->publish_text_sensor(TextSensorId::ZIGBEE, "Join/leave: choose the Router role first");
+    loop_.add_timer(6000, [this] { api_->publish_text_sensor(TextSensorId::ZIGBEE, ncp_status()); });
     return;
   }
   if (!zigbee_) return;
