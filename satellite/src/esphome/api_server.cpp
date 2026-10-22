@@ -135,6 +135,7 @@ enum Key : uint32_t {
   K_SELECT_QUICK_COMMANDS = 33,
   K_EVENT_VOICE_COMMAND = 34,
   K_SELECT_BT_TYPE = 35,
+  K_SW_SENDSPIN = 36,
 };
 
 // aioesphomeapi VoiceAssistantFeature bits.
@@ -371,7 +372,7 @@ struct ApiServer::Impl {
   MediaState media_state = MediaState::IDLE;
   float media_volume = 0;
   bool media_muted = false;
-  BoolState sw_mic_mute, sw_clock, sw_auto_update, sw_nearest_answers, sw_voice_indication, sw_bluetooth, bs_hw_mute;
+  BoolState sw_mic_mute, sw_clock, sw_auto_update, sw_nearest_answers, sw_voice_indication, sw_bluetooth, sw_sendspin, bs_hw_mute;
   UpdateState update;
   bool update_has = false;
   FloatState lux, clock_bri, clock_scroll, led_speed;
@@ -1349,6 +1350,13 @@ struct ApiServer::Impl {
       w.u32(8, ENTITY_CATEGORY_CONFIG);
       send_msg(c, LIST_SWITCH, w);
     }
+    if (cfg.has_sendspin) {
+      pb::Writer w;
+      entity_head(w, "sendspin", K_SW_SENDSPIN, "Sendspin");
+      w.str(5, "mdi:cast-audio");
+      w.u32(8, ENTITY_CATEGORY_CONFIG);
+      send_msg(c, LIST_SWITCH, w);
+    }
     if (cfg.has_bluetooth) {
       pb::Writer w;
       entity_head(w, "bluetooth", K_SW_BLUETOOTH, "Bluetooth");
@@ -1609,6 +1617,7 @@ struct ApiServer::Impl {
     send_switch(K_SW_NEAREST_ANSWERS, sw_nearest_answers, c);
     send_switch(K_SW_VOICE_INDICATION, sw_voice_indication, c);
     if (cfg.has_bluetooth) send_switch(K_SW_BLUETOOTH, sw_bluetooth, c);
+    if (cfg.has_sendspin) send_switch(K_SW_SENDSPIN, sw_sendspin, c);
     send_update(c);
     send_binary(K_BS_HW_MIC_MUTE, bs_hw_mute, c);
     send_float(SENSOR_STATE, K_SENSOR_LUX, lux, c);
@@ -1725,6 +1734,8 @@ struct ApiServer::Impl {
       hooks.on_switch(SwitchId::NEAREST_ANSWERS, state);
     else if (key == K_SW_VOICE_INDICATION)
       hooks.on_switch(SwitchId::VOICE_INDICATION, state);
+    else if (key == K_SW_SENDSPIN && cfg.has_sendspin)
+      hooks.on_switch(SwitchId::SENDSPIN, state);
     else if (key == K_SW_BLUETOOTH && cfg.has_bluetooth)
       hooks.on_switch(SwitchId::BLUETOOTH, state);
   }
@@ -2013,6 +2024,7 @@ void ApiServer::publish_switch(SwitchId id, bool state) {
     case SwitchId::NEAREST_ANSWERS: s = &impl_->sw_nearest_answers; key = K_SW_NEAREST_ANSWERS; break;
     case SwitchId::VOICE_INDICATION: s = &impl_->sw_voice_indication; key = K_SW_VOICE_INDICATION; break;
     case SwitchId::BLUETOOTH: s = &impl_->sw_bluetooth; key = K_SW_BLUETOOTH; break;
+    case SwitchId::SENDSPIN: s = &impl_->sw_sendspin; key = K_SW_SENDSPIN; break;
   }
   if (!s) return;
   s->has = true;

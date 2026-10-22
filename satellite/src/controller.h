@@ -44,6 +44,7 @@ struct Settings {
   bool voice_indication = true;    // listening / thinking / speaking shown on the ring
   std::string led_case_color;      // stem of Leds::case_colors(), "" = none
   std::string quick_commands = "playing";  // playing | always | off: commands without the wake word
+  bool sendspin = false;  // Station 2: the Sendspin player (its threads load the CPU there), off by default
   std::string bt_type = "Headphones";  // Bluetooth device class: Headphones / Speaker
   std::string led_style = "Standard";  // Station 2: "Standard" (Yandex patterns) / "Custom"
   // Release being installed. Still set after a restart into another version: that release was

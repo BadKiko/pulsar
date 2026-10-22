@@ -103,6 +103,7 @@ bool Settings::load(const std::string &path) {
     else if (k == "led_case_color") led_case_color = v;
     else if (k == "zigbee_ncp") zigbee_ncp = (v == "off" || v == "bridge") ? v : "router";
     else if (k == "quick_commands") quick_commands = (v == "always" || v == "off") ? v : "playing";
+    else if (k == "sendspin") sendspin = v != "0";
     else if (k == "bt_type") bt_type = v == "Speaker" ? "Speaker" : "Headphones";
     else if (k == "led_style") led_style = v == "Custom" ? "Custom" : "Standard";
   }
@@ -128,7 +129,7 @@ void Settings::save(const std::string &path) const {
       << "\nzigbee_role=" << ZigbeeService::role(zigbee_role).name << "\nzigbee_flash_failed=" << std::hex
       << zigbee_flash_failed << std::dec << "\nnearest_answers=" << nearest_answers << "\nmusic_viz=" << music_viz
       << "\nled_speed=" << led_speed << "\nvoice_indication=" << voice_indication
-      << "\nled_case_color=" << led_case_color << "\nquick_commands=" << quick_commands << "\nbt_type=" << bt_type << "\nled_style=" << led_style << "\nzigbee_ncp=" << zigbee_ncp << "\n";
+      << "\nled_case_color=" << led_case_color << "\nquick_commands=" << quick_commands << "\nsendspin=" << sendspin << "\nbt_type=" << bt_type << "\nled_style=" << led_style << "\nzigbee_ncp=" << zigbee_ncp << "\n";
   }
   rename(tmp.c_str(), path.c_str());
 }
@@ -182,6 +183,7 @@ bool Controller::start() {
   cfg.light_effects = Leds::effect_names();
   cfg.quick_commands = {"While playing", "Always", "Off"};
   cfg.has_bluetooth = model_.bluetooth;
+  cfg.has_sendspin = model_.panel;
   if (model_.bluetooth) cfg.bluetooth_types = {"Headphones", "Speaker"};
   cfg.zigbee_status = !model_.ncp_tty.empty();
   if (model_.panel) {
@@ -373,6 +375,7 @@ void Controller::on_client_connected(const std::string &client_info) {
   api_->publish_select(SelectId::MUSIC_VIZ, st_.music_viz);
   api_->publish_select(SelectId::QUICK_COMMANDS,
                        st_.quick_commands == "always" ? "Always" : st_.quick_commands == "off" ? "Off" : "While playing");
+  if (model_.panel) api_->publish_switch(SwitchId::SENDSPIN, st_.sendspin);
   if (bt_) {
     api_->publish_switch(SwitchId::BLUETOOTH, bt_->pairing());
     api_->publish_select(SelectId::BLUETOOTH_TYPE, st_.bt_type);
@@ -890,7 +893,7 @@ void Controller::start_sendspin(const DeviceIdentity &id) {
   };
   h.on_music = [this](const MusicFrame &f) { leds_.music_frame(f, true); };
   sendspin_ = std::make_unique<SendspinService>(loop_, std::move(cfg), std::move(h));
-  if (!sendspin_->start(st_.volume, st_.muted)) {
+  if (!(st_.sendspin || !model_.panel) || !sendspin_->start(st_.volume, st_.muted)) {
     LOGE("Sendspin player unavailable");
     sendspin_.reset();
   }
@@ -1108,6 +1111,13 @@ void Controller::on_switch(SwitchId id, bool state) {
   } else if (id == SwitchId::VOICE_INDICATION) {
     st_.voice_indication = state;
     leds_.set_voice_indication(state);
+  } else if (id == SwitchId::SENDSPIN) {
+    st_.sendspin = state;
+    api_->publish_switch(id, state);
+    persist();
+    LOGW("sendspin %s, restarting", state ? "on" : "off");
+    loop_.stop();  // the player starts with the daemon
+    return;
   } else if (id == SwitchId::BLUETOOTH) {
     if (bt_) bt_->set_pairing(state);  // the state is published when the adapter has changed
     return;

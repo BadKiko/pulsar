@@ -20,7 +20,7 @@ constexpr const char *kOff =
 // bluetoothd resets the class on its own now and then (main.conf: loudspeaker), so it is set again
 // with every window; paired devices are trusted so that they reconnect without a new pairing.
 constexpr const char *kTrust = "for m in $(bluetoothctl devices Paired | cut -d' ' -f2); do bluetoothctl trust $m; done";
-constexpr const char *kClassHeadphones = "hciconfig hci0 class 0x4c0418";  // Audio/Video, headphones
+constexpr const char *kClassHeadphones = "hciconfig hci0 class 0x240404";  // Audio/Video, wearable headset (as WH-1000XM4)
 constexpr const char *kClassSpeaker = "hciconfig hci0 class 0x4c0414";     // Audio/Video, loudspeaker
 // bluealsa starts as an A2DP sink + phone (HFP-AG). Windows lists a device with the connect /
 // disconnect button only when it also offers the headset roles, so they are added (once per boot).
