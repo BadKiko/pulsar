@@ -22,6 +22,14 @@ constexpr const char *kOff =
 constexpr const char *kTrust = "for m in $(bluetoothctl devices Paired | cut -d' ' -f2); do bluetoothctl trust $m; done";
 constexpr const char *kClassHeadphones = "hciconfig hci0 class 0x4c0418";  // Audio/Video, headphones
 constexpr const char *kClassSpeaker = "hciconfig hci0 class 0x4c0414";     // Audio/Video, loudspeaker
+// bluealsa starts as an A2DP sink + phone (HFP-AG). Windows lists a device with the connect /
+// disconnect button only when it also offers the headset roles, so they are added (once per boot).
+constexpr const char *kProfiles =
+    "pid=$(pidof bluealsa) || exit 0; "
+    "grep -q hfp-hf /proc/$pid/cmdline && exit 0; "
+    "/etc/init.d/S53bluealsa-aplay stop; /etc/init.d/S52bluealsa stop; sleep 1; "
+    "start-stop-daemon -S -b -x /usr/bin/bluealsa -n bluealsa -- -p a2dp-sink -p a2dp-source -p hfp-ag "
+    "-p hfp-hf -p hsp-hs --sbc-quality=high; sleep 2; /etc/init.d/S53bluealsa-aplay start";
 constexpr const char *kExpired = "bluetoothctl pairable off";  // window timed out: no more new pairings
 
 }  // namespace
@@ -74,6 +82,7 @@ bool Bluetooth::query_discoverable() {
 }
 
 void Bluetooth::run() {
+  if (system(kProfiles) != 0) LOGW("bluetooth: could not add the headset profiles");
   std::unique_lock<std::mutex> lk(mu_);
   for (;;) {
     // while the window is open, look every 10 s whether it timed out
