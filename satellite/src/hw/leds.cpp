@@ -95,7 +95,7 @@ struct StockPattern {
   }
 };
 
-enum Layer { L_VOLUME = 1, L_VOICE, L_ONESHOT, L_SHOW, L_MUTE, L_USER, L_MUSIC, L_OFF };
+enum Layer { L_VOLUME = 1, L_VOICE, L_ONESHOT, L_SHOW, L_MUTE, L_USER, L_MUSIC, L_BT, L_OFF };
 
 fx::Voice to_voice(UiState s) {
   switch (s) {
@@ -169,7 +169,9 @@ struct Leds::Impl {
   float volume = 0;
   int64_t volume_until = 0;
   // stock panel patterns (Station 2 only, loaded on first use)
-  StockPattern sp_listen, sp_think, sp_speak, sp_error, sp_volume;
+  StockPattern sp_listen, sp_think, sp_speak, sp_error, sp_volume, sp_bt;
+  bool bt_on = false;
+  int64_t bt_t0 = 0;
   bool stock_tried = false, stock_ok = false, use_stock = true;
   bool ensure_stock() {
     if (stock_tried || n != 89) return stock_ok;
@@ -178,6 +180,7 @@ struct Leds::Impl {
     stock_ok = sp_listen.load(dir + "alice_listening.led") && sp_think.load(dir + "alice_thinking.led") &&
                sp_speak.load(dir + "alice_speaking.led") && sp_error.load(dir + "error.led") &&
                sp_volume.load(dir + "volume.led");
+    sp_bt.load(dir + "bluetooth_pairing.led");  // optional
     LOGI("leds: stock panel patterns %s", stock_ok ? "loaded" : "unavailable");
     return stock_ok;
   }
@@ -416,6 +419,12 @@ struct Leds::Impl {
         break;
       case L_USER: animated = fx::effect(user_effect, user_col, user_bri, phase, dt, user_fx, ring, n); break;
       case L_MUSIC: render_music(now, ring); break;
+      case L_BT:
+        if (use_stock && ensure_stock() && !sp_bt.frames.empty())
+          sp_bt.draw(sp_bt.index_at(int64_t(double(now - bt_t0) * speed), true), ring, n);
+        else
+          fx::effect("Breathe", fx::rgb(0, 100, 255), 1, phase, dt, show_fx, ring, n);
+        break;
       default: animated = false; break;
     }
     if (nlogo) {
@@ -437,6 +446,7 @@ struct Leds::Impl {
     if (now < volume_until) return L_VOLUME;
     if (voice_shown()) return L_VOICE;
     if (sweep != Sweep::NONE || timer_shot) return L_ONESHOT;
+    if (bt_on) return L_BT;
     if (show_on) return L_SHOW;
     if (short_ring && muted) return L_MUTE;
     if (user_on && user_bri > 0) return L_USER;
@@ -665,6 +675,14 @@ void Leds::set_music_style(const std::string &style) {
   if (i == all.size() || i == d.style) return;
   d.style = i;
   d.cycle_t0 = Loop::now_ms();
+  d.frame();
+}
+
+void Leds::set_bluetooth(bool pairing) {
+  auto &d = *impl_;
+  if (d.bt_on == pairing) return;
+  d.bt_on = pairing;
+  d.bt_t0 = Loop::now_ms();
   d.frame();
 }
 

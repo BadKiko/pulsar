@@ -56,6 +56,7 @@ class Leds {
   void set_voice_indication(bool on);
   void set_speed(float k);  // 0.25..4: motion of effects and music styles
   void set_music_style(const std::string &style);  // one of music_styles()
+  void set_bluetooth(bool pairing);                // pairing indication (Bluetooth speaker mode)
   void set_stock_style(bool on);                   // panel: Yandex patterns for voice / volume
   void set_media_playing(bool playing);
   // Music features, ~30 per second while playing. Sendspin frames take precedence over the speaker

@@ -102,6 +102,7 @@ bool Settings::load(const std::string &path) {
     else if (k == "voice_indication") voice_indication = v == "1";
     else if (k == "led_case_color") led_case_color = v;
     else if (k == "zigbee_ncp") zigbee_ncp = (v == "off" || v == "bridge") ? v : "router";
+    else if (k == "quick_commands") quick_commands = (v == "always" || v == "off") ? v : "playing";
     else if (k == "led_style") led_style = v == "Custom" ? "Custom" : "Standard";
   }
   const auto &styles = Leds::music_styles();
@@ -126,7 +127,7 @@ void Settings::save(const std::string &path) const {
       << "\nzigbee_role=" << ZigbeeService::role(zigbee_role).name << "\nzigbee_flash_failed=" << std::hex
       << zigbee_flash_failed << std::dec << "\nnearest_answers=" << nearest_answers << "\nmusic_viz=" << music_viz
       << "\nled_speed=" << led_speed << "\nvoice_indication=" << voice_indication
-      << "\nled_case_color=" << led_case_color << "\nled_style=" << led_style << "\nzigbee_ncp=" << zigbee_ncp << "\n";
+      << "\nled_case_color=" << led_case_color << "\nquick_commands=" << quick_commands << "\nled_style=" << led_style << "\nzigbee_ncp=" << zigbee_ncp << "\n";
   }
   rename(tmp.c_str(), path.c_str());
 }
@@ -178,6 +179,8 @@ bool Controller::start() {
   if (st_.wake_word != "alisa" && st_.wake_word != "yandex") st_.wake_word = "alisa";
   cfg.active_wake_words = {st_.wake_word};
   cfg.light_effects = Leds::effect_names();
+  cfg.quick_commands = {"While playing", "Always", "Off"};
+  cfg.has_bluetooth = model_.bluetooth;
   cfg.zigbee_status = !model_.ncp_tty.empty();
   if (model_.panel) {
     const auto &pe = Leds::panel_effect_names();
@@ -330,6 +333,13 @@ bool Controller::start() {
     api_->mdns()->add_service("_sendspin._tcp", id.name, kSendspinPort,
                               {"path=/sendspin", "name=" + id.friendly_name});
   start_zigbee(id);
+  if (model_.bluetooth) {
+    bt_ = std::make_unique<Bluetooth>(loop_, [this] {
+      leds_.set_bluetooth(bt_->pairing());
+      api_->publish_switch(SwitchId::BLUETOOTH, bt_->pairing());
+    });
+    bt_->start();
+  }
   update_ui();
   return true;
 }
@@ -358,6 +368,9 @@ void Controller::on_client_connected(const std::string &client_info) {
   api_->publish_select(SelectId::CLOCK_FACE, clock_face_);
   api_->publish_number(NumberId::LED_SPEED, st_.led_speed);
   api_->publish_select(SelectId::MUSIC_VIZ, st_.music_viz);
+  api_->publish_select(SelectId::QUICK_COMMANDS,
+                       st_.quick_commands == "always" ? "Always" : st_.quick_commands == "off" ? "Off" : "While playing");
+  if (bt_) api_->publish_switch(SwitchId::BLUETOOTH, bt_->pairing());
   api_->publish_select(SelectId::LED_STYLE, st_.led_style);
   api_->publish_select(SelectId::CASE_COLOR, st_.led_case_color.empty() ? "None" : st_.led_case_color);
   if (!model_.ncp_tty.empty()) {
@@ -1089,6 +1102,9 @@ void Controller::on_switch(SwitchId id, bool state) {
   } else if (id == SwitchId::VOICE_INDICATION) {
     st_.voice_indication = state;
     leds_.set_voice_indication(state);
+  } else if (id == SwitchId::BLUETOOTH) {
+    if (bt_) bt_->set_pairing(state);  // the state is published when the adapter has changed
+    return;
   }
   api_->publish_switch(id, state);
   persist();
@@ -1273,6 +1289,13 @@ void Controller::on_select(SelectId id, const std::string &option) {
     update_music();
     return;
   }
+  if (id == SelectId::QUICK_COMMANDS) {
+    st_.quick_commands = option == "Always" ? "always" : option == "Off" ? "off" : "playing";
+    api_->publish_select(id, option);
+    persist();
+    update_commands();
+    return;
+  }
   if (id == SelectId::LED_STYLE) {
     st_.led_style = option == "Custom" ? "Custom" : "Standard";
     leds_.set_stock_style(st_.led_style != "Custom");
@@ -1365,7 +1388,8 @@ void Controller::update_commands() {
                  announcing_ || timer_ringing_ || phase_ == Phase::SPEAKING;
   bool after_wake =
       (phase_ == Phase::LISTENING && Loop::now_ms() - listen_started_ms_ < kCommandAfterWakeMs) || arbitrating_;
-  mic_.set_commands(!st_.mic_muted && !hw_mic_muted_ && (playing || after_wake));
+  const bool quick = st_.quick_commands == "always" || (st_.quick_commands == "playing" && playing);
+  mic_.set_commands(!st_.mic_muted && !hw_mic_muted_ && (quick || after_wake));
 }
 
 void Controller::music_pause() {
@@ -1381,6 +1405,30 @@ void Controller::music_resume() {
     sendspin_->transport(SendspinService::Transport::PLAY);
 }
 
+// "включи / выключи блютуз" switch the speaker's pairing mode; "включи / выключи свет / телевизор",
+// "лайк" and "дизлайк" go to Home Assistant as events of the «Voice command» entity.
+bool Controller::extra_command(const std::string &word) {
+  if (Loop::now_ms() < commands_blocked_until_ms_ || arbitrating_) return false;
+  const bool off = word.find("выключи") != std::string::npos;
+  const bool on = !off && word.find("включи") != std::string::npos;
+  auto has = [&](const char *w) { return word.find(w) != std::string::npos; };
+  if (has("блютуз")) {
+    if (!bt_ || (!on && !off)) return false;
+    LOGI("voice command '%s': Bluetooth pairing %s", word.c_str(), on ? "on" : "off");
+    bt_->set_pairing(on);
+    return true;
+  }
+  const char *ev = nullptr;
+  if (has("свет")) ev = on ? "light_on" : off ? "light_off" : nullptr;
+  else if (has("телевизор")) ev = on ? "tv_on" : off ? "tv_off" : nullptr;
+  else if (word == "лайк") ev = "like";
+  else if (word == "дизлайк") ev = "dislike";
+  if (!ev) return false;
+  LOGI("voice command '%s' -> event %s", word.c_str(), ev);
+  api_->fire_event(EventId::VOICE_COMMAND, ev);
+  return true;
+}
+
 void Controller::on_command(const std::string &word) {
   if (st_.mic_muted || hw_mic_muted_) return;
   enum { NONE, STOP, PAUSE, RESUME, LOUDER, QUIETER, NEXT, PREV } c = NONE;
@@ -1391,7 +1439,12 @@ void Controller::on_command(const std::string &word) {
   else if (word == "тише") c = QUIETER;
   else if (word == "дальше" || word == "следующий") c = NEXT;
   else if (word == "назад") c = PREV;
-  if (c == NONE) return;  // TV navigation, "включи свет" etc. are left to Home Assistant
+  if (c == NONE) {  // Bluetooth is handled here, light / TV / like as events; navigation words are ignored
+    if (extra_command(word) && phase_ == Phase::LISTENING &&
+        Loop::now_ms() - listen_started_ms_ < kCommandAfterWakeMs)
+      finish_interaction();
+    return;
+  }
   if (Loop::now_ms() < commands_blocked_until_ms_) {
     LOGI("voice command '%s' ignored: another station answers this wake word", word.c_str());
     return;

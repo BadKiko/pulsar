@@ -65,6 +65,7 @@ struct Model {
 
   // 2-D LED panel (Station 2): stock patterns and panel effects instead of ring ones.
   bool panel = false;
+  bool bluetooth = false;  // bluealsa speaker mode can be switched from pulsar
 };
 
 // The detected model; nullptr on unsupported hardware.

@@ -15,6 +15,7 @@
 #include "model.h"
 #include "sendspin/sendspin_service.h"
 #include "update/updater.h"
+#include "hw/bluetooth.h"
 #include "zigbee/ezsp_bridge.h"
 #include "zigbee/ezsp_router.h"
 #include "zigbee/service.h"
@@ -42,6 +43,7 @@ struct Settings {
   float led_speed = 1;             // 0.25..4
   bool voice_indication = true;    // listening / thinking / speaking shown on the ring
   std::string led_case_color;      // stem of Leds::case_colors(), "" = none
+  std::string quick_commands = "playing";  // playing | always | off: commands without the wake word
   std::string led_style = "Standard";  // Station 2: "Standard" (Yandex patterns) / "Custom"
   // Release being installed. Still set after a restart into another version: that release was
   // rolled back by supervise.sh (crash loop), automatic updates skip it.
@@ -207,6 +209,8 @@ class Controller : public ApiHooks {
   std::unique_ptr<ZigbeeService> zigbee_;
   std::unique_ptr<EzspBridge> ezsp_;
   std::unique_ptr<EzspRouter> ezsp_router_;
+  std::unique_ptr<Bluetooth> bt_;
+  bool extra_command(const std::string &word);
   std::string ncp_status() const;
   const char *ncp_label() const;
   std::string zigbee_status_;  // last status line published

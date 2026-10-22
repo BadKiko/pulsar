@@ -131,6 +131,9 @@ enum Key : uint32_t {
   K_SELECT_CASE_COLOR = 29,
   K_ACTION_LED_SHOW = 30,
   K_SELECT_LED_STYLE = 31,
+  K_SW_BLUETOOTH = 32,
+  K_SELECT_QUICK_COMMANDS = 33,
+  K_EVENT_VOICE_COMMAND = 34,
 };
 
 // aioesphomeapi VoiceAssistantFeature bits.
@@ -367,11 +370,11 @@ struct ApiServer::Impl {
   MediaState media_state = MediaState::IDLE;
   float media_volume = 0;
   bool media_muted = false;
-  BoolState sw_mic_mute, sw_clock, sw_auto_update, sw_nearest_answers, sw_voice_indication, bs_hw_mute;
+  BoolState sw_mic_mute, sw_clock, sw_auto_update, sw_nearest_answers, sw_voice_indication, sw_bluetooth, bs_hw_mute;
   UpdateState update;
   bool update_has = false;
   FloatState lux, clock_bri, clock_scroll, led_speed;
-  StrState clock_text, clock_face, zigbee_mode, zigbee_status, music_viz, case_color, led_style;
+  StrState clock_text, clock_face, zigbee_mode, zigbee_status, music_viz, case_color, led_style, quick_commands;
   LightState light;
   // Diagnostics, refreshed by diag_timer.
   FloatState rssi;
@@ -1345,6 +1348,12 @@ struct ApiServer::Impl {
       w.u32(8, ENTITY_CATEGORY_CONFIG);
       send_msg(c, LIST_SWITCH, w);
     }
+    if (cfg.has_bluetooth) {
+      pb::Writer w;
+      entity_head(w, "bluetooth", K_SW_BLUETOOTH, "Bluetooth");
+      w.str(5, "mdi:bluetooth");
+      send_msg(c, LIST_SWITCH, w);
+    }
     {
       pb::Writer w;
       entity_head(w, "voice_indication", K_SW_VOICE_INDICATION, "Voice indication");
@@ -1377,6 +1386,9 @@ struct ApiServer::Impl {
                   cfg.music_styles);
     if (cfg.has_case_color)
       select_entity("case_color", K_SELECT_CASE_COLOR, "Case color", "mdi:palette", cfg.case_colors);
+    if (!cfg.quick_commands.empty())
+      select_entity("quick_commands", K_SELECT_QUICK_COMMANDS, "Quick commands", "mdi:microphone-message",
+                    cfg.quick_commands);
     if (!cfg.led_styles.empty())
       select_entity("led_style", K_SELECT_LED_STYLE, "LED style", "mdi:led-strip-variant", cfg.led_styles);
     {
@@ -1422,6 +1434,13 @@ struct ApiServer::Impl {
       w.packed_u32(12, {COLOR_MODE_RGB});
       w.str(14, "mdi:led-strip-variant");
       send_msg(c, LIST_LIGHT, w);
+    }
+    {
+      pb::Writer w;
+      entity_head(w, "voice_command", K_EVENT_VOICE_COMMAND, "Voice command");
+      w.str(5, "mdi:account-voice");
+      for (const char *t : {"light_on", "light_off", "tv_on", "tv_off", "like", "dislike"}) w.str(9, t, true);
+      send_msg(c, LIST_EVENT, w);
     }
     {
       pb::Writer w;
@@ -1586,6 +1605,7 @@ struct ApiServer::Impl {
     send_switch(K_SW_AUTO_UPDATE, sw_auto_update, c);
     send_switch(K_SW_NEAREST_ANSWERS, sw_nearest_answers, c);
     send_switch(K_SW_VOICE_INDICATION, sw_voice_indication, c);
+    if (cfg.has_bluetooth) send_switch(K_SW_BLUETOOTH, sw_bluetooth, c);
     send_update(c);
     send_binary(K_BS_HW_MIC_MUTE, bs_hw_mute, c);
     send_float(SENSOR_STATE, K_SENSOR_LUX, lux, c);
@@ -1604,6 +1624,8 @@ struct ApiServer::Impl {
     send_float(NUMBER_STATE, K_NUMBER_LED_SPEED, led_speed, c);
     send_str(SELECT_STATE, K_SELECT_MUSIC_VIZ, music_viz.v, music_viz.has, c);
     if (cfg.has_case_color) send_str(SELECT_STATE, K_SELECT_CASE_COLOR, case_color.v, case_color.has, c);
+    if (!cfg.quick_commands.empty())
+      send_str(SELECT_STATE, K_SELECT_QUICK_COMMANDS, quick_commands.v, quick_commands.has, c);
     if (!cfg.led_styles.empty()) send_str(SELECT_STATE, K_SELECT_LED_STYLE, led_style.v, led_style.has, c);
     if (!cfg.zigbee_modes.empty()) {
       send_str(SELECT_STATE, K_SELECT_ZIGBEE_MODE, zigbee_mode.v, zigbee_mode.has, c);
@@ -1699,6 +1721,8 @@ struct ApiServer::Impl {
       hooks.on_switch(SwitchId::NEAREST_ANSWERS, state);
     else if (key == K_SW_VOICE_INDICATION)
       hooks.on_switch(SwitchId::VOICE_INDICATION, state);
+    else if (key == K_SW_BLUETOOTH && cfg.has_bluetooth)
+      hooks.on_switch(SwitchId::BLUETOOTH, state);
   }
 
   void on_number_cmd(pb::Reader &r) {
@@ -1752,6 +1776,12 @@ struct ApiServer::Impl {
       for (const auto &o : cfg.zigbee_modes)
         if (o == s) return hooks.on_select(SelectId::ZIGBEE_MODE, s);
       LOGW("api: unknown Zigbee role '%s'", s.c_str());
+      return;
+    }
+    if (key == K_SELECT_QUICK_COMMANDS) {
+      for (const auto &o : cfg.quick_commands)
+        if (o == s) return hooks.on_select(SelectId::QUICK_COMMANDS, s);
+      LOGW("api: unknown quick commands mode '%s'", s.c_str());
       return;
     }
     if (key == K_SELECT_LED_STYLE) {
@@ -1973,6 +2003,7 @@ void ApiServer::publish_switch(SwitchId id, bool state) {
     case SwitchId::AUTO_UPDATE: s = &impl_->sw_auto_update; key = K_SW_AUTO_UPDATE; break;
     case SwitchId::NEAREST_ANSWERS: s = &impl_->sw_nearest_answers; key = K_SW_NEAREST_ANSWERS; break;
     case SwitchId::VOICE_INDICATION: s = &impl_->sw_voice_indication; key = K_SW_VOICE_INDICATION; break;
+    case SwitchId::BLUETOOTH: s = &impl_->sw_bluetooth; key = K_SW_BLUETOOTH; break;
   }
   if (!s) return;
   s->has = true;
@@ -2020,6 +2051,7 @@ void ApiServer::publish_select(SelectId id, const std::string &state) {
     case SelectId::MUSIC_VIZ: s = &impl_->music_viz; key = K_SELECT_MUSIC_VIZ; break;
     case SelectId::CASE_COLOR: s = &impl_->case_color; key = K_SELECT_CASE_COLOR; break;
     case SelectId::LED_STYLE: s = &impl_->led_style; key = K_SELECT_LED_STYLE; break;
+    case SelectId::QUICK_COMMANDS: s = &impl_->quick_commands; key = K_SELECT_QUICK_COMMANDS; break;
   }
   if (!s) return;
   *s = {true, state};
@@ -2037,10 +2069,10 @@ void ApiServer::publish_light(const LightState &st) {
   if (impl_->states_on()) impl_->send_light();
 }
 
-void ApiServer::fire_event(EventId, const std::string &event_type) {
+void ApiServer::fire_event(EventId id, const std::string &event_type) {
   if (!impl_->states_on()) return;
   pb::Writer w;
-  w.fixed32(1, K_EVENT_BUTTON, true);
+  w.fixed32(1, id == EventId::VOICE_COMMAND ? K_EVENT_VOICE_COMMAND : K_EVENT_BUTTON, true);
   w.str(2, event_type, true);
   impl_->broadcast(EVENT_RESP, w);
 }
