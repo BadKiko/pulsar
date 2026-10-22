@@ -15,6 +15,7 @@
 #include "model.h"
 #include "sendspin/sendspin_service.h"
 #include "update/updater.h"
+#include "zigbee/ezsp_bridge.h"
 #include "zigbee/service.h"
 
 namespace cs {
@@ -202,6 +203,7 @@ class Controller : public ApiHooks {
   uint64_t update_retry_ = 0;  // waits for idle before an automatic install
   // Zigbee radio (Midi): coordinator for ZHA or router in another network.
   std::unique_ptr<ZigbeeService> zigbee_;
+  std::unique_ptr<EzspBridge> ezsp_;
   std::string zigbee_status_;  // last status line published
   // Sendspin (Music Assistant) player; declared last so it stops (and stops calling back into
   // the members above) first.

@@ -177,6 +177,7 @@ bool Controller::start() {
   if (st_.wake_word != "alisa" && st_.wake_word != "yandex") st_.wake_word = "alisa";
   cfg.active_wake_words = {st_.wake_word};
   cfg.light_effects = Leds::effect_names();
+  cfg.zigbee_status = !model_.ncp_tty.empty();
   if (model_.panel) {
     const auto &pe = Leds::panel_effect_names();
     cfg.light_effects.insert(cfg.light_effects.end(), pe.begin(), pe.end());
@@ -356,6 +357,7 @@ void Controller::on_client_connected(const std::string &client_info) {
   api_->publish_select(SelectId::MUSIC_VIZ, st_.music_viz);
   api_->publish_select(SelectId::LED_STYLE, st_.led_style);
   api_->publish_select(SelectId::CASE_COLOR, st_.led_case_color.empty() ? "None" : st_.led_case_color);
+  if (ezsp_) api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_->status());
   if (zigbee_) {
     api_->publish_select(SelectId::ZIGBEE_MODE, ZigbeeService::role(st_.zigbee_role).label);
     api_->publish_text_sensor(TextSensorId::ZIGBEE, zigbee_->status());
@@ -870,6 +872,16 @@ void Controller::start_sendspin(const DeviceIdentity &id) {
 }
 
 void Controller::start_zigbee(const DeviceIdentity &id) {
+  if (!model_.ncp_tty.empty()) {  // Silicon Labs NCP: plain TCP serial port for Z2M / ZHA
+    ezsp_ = std::make_unique<EzspBridge>(loop_, model_.ncp_tty, model_.ncp_baud, kZigbeePort, [this] {
+      LOGI("zigbee: %s", ezsp_->status().c_str());
+      api_->publish_text_sensor(TextSensorId::ZIGBEE, ezsp_->status());
+    });
+    if (ezsp_->start() && api_->mdns())
+      api_->mdns()->add_service("_zigbee-coordinator._tcp", id.name, kZigbeePort,
+                                {"radio_type=ezsp", "serial_number=" + id.name, "name=" + id.friendly_name});
+    return;
+  }
   if (model_.zigbee_tty.empty()) return;
   const auto slash = state_path_.rfind('/');
   const std::string dir = slash == std::string::npos ? std::string(".") : state_path_.substr(0, slash);

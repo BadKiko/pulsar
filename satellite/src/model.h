@@ -59,6 +59,10 @@ struct Model {
   std::string zigbee_tty;
   std::string zigbee_reset, zigbee_boot;
 
+  // Silicon Labs EZSP NCP on a UART (Station 2), offered as a TCP serial port; empty: none.
+  std::string ncp_tty;
+  unsigned ncp_baud = 115200;
+
   // 2-D LED panel (Station 2): stock patterns and panel effects instead of ring ones.
   bool panel = false;
 };

@@ -1502,8 +1502,8 @@ struct ApiServer::Impl {
       };
       button("zigbee_join", K_BUTTON_ZIGBEE_JOIN, "Zigbee join network", "mdi:link-variant");
       button("zigbee_leave", K_BUTTON_ZIGBEE_LEAVE, "Zigbee leave network", "mdi:link-variant-off");
-      text("zigbee", K_TEXT_ZIGBEE, "Zigbee", "mdi:zigbee");
     }
+    if (!cfg.zigbee_modes.empty() || cfg.zigbee_status) text("zigbee", K_TEXT_ZIGBEE, "Zigbee", "mdi:zigbee");
     // User-defined actions (HA registers esphome.<device>_<name>; every argument is required).
     auto action = [&](const char *name, uint32_t key, std::initializer_list<std::pair<const char *, uint32_t>> args) {
       pb::Writer w;
@@ -1607,8 +1607,9 @@ struct ApiServer::Impl {
     if (!cfg.led_styles.empty()) send_str(SELECT_STATE, K_SELECT_LED_STYLE, led_style.v, led_style.has, c);
     if (!cfg.zigbee_modes.empty()) {
       send_str(SELECT_STATE, K_SELECT_ZIGBEE_MODE, zigbee_mode.v, zigbee_mode.has, c);
-      send_str(TEXT_SENSOR_STATE, K_TEXT_ZIGBEE, zigbee_status.v, zigbee_status.has, c);
     }
+    if (!cfg.zigbee_modes.empty() || cfg.zigbee_status)
+      send_str(TEXT_SENSOR_STATE, K_TEXT_ZIGBEE, zigbee_status.v, zigbee_status.has, c);
   }
 
   void send_update(const ClientPtr &to = nullptr) {
@@ -2027,7 +2028,7 @@ void ApiServer::publish_select(SelectId id, const std::string &state) {
 
 void ApiServer::publish_text_sensor(TextSensorId, const std::string &state) {
   impl_->zigbee_status = {true, state};
-  if (impl_->states_on() && !impl_->cfg.zigbee_modes.empty())
+  if (impl_->states_on() && (!impl_->cfg.zigbee_modes.empty() || impl_->cfg.zigbee_status))
     impl_->send_str(TEXT_SENSOR_STATE, K_TEXT_ZIGBEE, state, true);
 }
 

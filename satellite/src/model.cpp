@@ -101,6 +101,7 @@ Model station2() {
   m.error_sound = "ru-RU/vins_error.wav";
   m.volume_map = {{0, 0}, {1, 49}, {20, 255}};
   m.panel = true;
+  m.ncp_tty = "/dev/ttyS3";  // quasar.cfg zigbee.tty.port; EFR32 answers ASH RST at 115200 8N1
   return m;
 }
 

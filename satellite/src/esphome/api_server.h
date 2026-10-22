@@ -172,6 +172,7 @@ struct ApiConfig {
   std::vector<std::string> music_styles;          // Select «Music visualization» options
   std::vector<std::string> case_colors;           // Select «Case color» options, "None" first
   std::vector<std::string> led_styles;            // Select «LED style» options; empty: no entity
+  bool zigbee_status = false;                     // Zigbee text sensor without role / buttons
   bool has_clock = true;                          // 7-segment clock entities
   bool has_case_color = true;                     // Select «Case color»
   // Select «Zigbee role» options; empty: no Zigbee entities (no radio).
