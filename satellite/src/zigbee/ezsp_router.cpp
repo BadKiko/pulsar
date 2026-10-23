@@ -63,7 +63,7 @@ struct EzspRouter::Impl {
   Bytes rx;
   unsigned frm = 0, ack = 0;  // next DATA frame number to send / expected from the NCP
   uint8_t seq = 0;
-  bool joined = false, node_dirty = false, reset_seen = false;
+  bool joined = false, node_dirty = false, reset_seen = false, reset_ok = false;
   uint16_t node_id = 0xFFFF;
   std::vector<std::pair<uint16_t, Bytes>> pending_cb;  // callbacks seen while waiting for a response
 
@@ -171,6 +171,8 @@ struct EzspRouter::Impl {
   }
 
   bool ash_reset() {
+    reset_ok = true;  // the RSTACK answering our own RST is expected
+    struct Guard { bool &f; ~Guard() { f = false; } } guard{reset_ok};
     rx.clear();
     frm = ack = 0;
     for (int i = 0; i < 3; i++) {
@@ -203,6 +205,13 @@ struct EzspRouter::Impl {
     if ((c & 0xE0) == 0x80) {  // ACK
       if (acked && (c & 7) == ((frm + 1) & 7)) *acked = true;
     } else if (c == 0xC1 || c == 0xC2) {
+      if (!reset_ok) {
+        char b[64];
+        snprintf(b, sizeof b, "%02x", c);
+        std::string hex = b;
+        for (size_t i = 1; i < f.size() && i < 6; i++) { snprintf(b, sizeof b, " %02x", f[i]); hex += b; }
+        LOGW("zigbee: NCP sent %s frame (%s)", c == 0xC1 ? "RSTACK" : "ERROR", hex.c_str());
+      }
       reset_seen = true;
       if (reset) *reset = true;
     }
@@ -548,6 +557,7 @@ void EzspRouter::run() {
     while (ok && !stop_) {
       d.drain(250);
       if (d.reset_seen) {
+        LOGW("zigbee: the NCP reset itself or reported an ASH error");
         ok = false;
         break;
       }
@@ -569,6 +579,7 @@ void EzspRouter::run() {
         last_check = Clock::now();
         uint8_t st;
         ok = d.net_state(st);
+        if (!ok) LOGW("zigbee: watchdog: the NCP did not answer the network state request");
         if (ok) {
           d.joined = st == 2;
           set_status(d.idle_status());
