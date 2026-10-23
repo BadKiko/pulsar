@@ -1,6 +1,7 @@
 #include "hw/bluetooth.h"
 
 #include <chrono>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,15 +84,25 @@ bool Bluetooth::query_discoverable() {
 
 void Bluetooth::run() {
   if (system(kProfiles) != 0) LOGW("bluetooth: could not add the headset profiles");
-  std::unique_lock<std::mutex> lk(mu_);
+  // Polls instead of waiting on a std::condition_variable: libc++'s wait() returns at once on the
+  // Station 2 (glibc 2.30 userland), which kept this thread at 100 % of a core.
+  int idle_ticks = 0;
   for (;;) {
-    // while the window is open, look every 10 s whether it timed out
-    if (pairing_) cv_.wait_for(lk, std::chrono::seconds(10), [this] { return stop_ || want_ >= 0; });
-    else cv_.wait(lk, [this] { return stop_ || want_ >= 0; });
-    if (stop_) return;
-    const int want = want_;
-    want_ = -1;
-    lk.unlock();
+    int want = -1;
+    bool open = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (stop_) return;
+      want = want_;
+      want_ = -1;
+      open = pairing_;
+    }
+    if (want < 0) {
+      usleep(100000);
+      // while the window is open, look every 10 s whether it timed out
+      if (!open || ++idle_ticks < 100) continue;
+    }
+    idle_ticks = 0;
     const char *cls = headphones_ ? kClassHeadphones : kClassSpeaker;
     if (want == 3) {
       system(cls);
@@ -106,10 +117,12 @@ void Bluetooth::run() {
       system(cls);
       system(kTrust);
     }
-    lk.lock();
-    const bool was = pairing_;
-    pairing_ = now;
-    lk.unlock();
+    bool was;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      was = pairing_;
+      pairing_ = now;
+    }
     if (was && !now && want != 0) system(kExpired);
     if (was != now) {
       LOGI("bluetooth: pairing %s", now ? "open" : "closed");
@@ -118,7 +131,6 @@ void Bluetooth::run() {
         if (*alive && changed_) changed_();
       });
     }
-    lk.lock();
   }
 }
 
